@@ -406,11 +406,26 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     if server_args.node_rank != 0:
         return p
 
-    _wait_server_healthy(
-        base_url=server_args.url(),
-        api_key=server_args.api_key,
-        is_process_alive=lambda: p.is_alive(),
-    )
+    try:
+        _wait_server_healthy(
+            base_url=server_args.url(),
+            api_key=server_args.api_key,
+            is_process_alive=lambda: p.is_alive(),
+        )
+    except BaseException:
+        # The caller cannot own this handle until we return. Clean up this
+        # launch before propagating the original startup error or interrupt.
+        try:
+            if p.is_alive():
+                kill_process_tree(p.pid)
+        except BaseException:
+            logger.warning("Failed to stop SGLang startup process %s", p.pid, exc_info=True)
+        finally:
+            try:
+                p.join(timeout=5.0)
+            except BaseException:
+                logger.warning("Failed to join SGLang startup process %s", p.pid, exc_info=True)
+        raise
 
     return p
 

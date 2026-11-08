@@ -1,0 +1,174 @@
+{
+  "schema_version": 1,
+  "artifact_type": "non_executable_training_plan",
+  "status": "IMPLEMENTED_PENDING_DEPLOYMENT_ACCEPTANCE",
+  "training_ready": false,
+  "scope": "Full-model Kimi K3 RL over the approved AgentSpark dataset on 16 nodes with 8 B300 GPUs each; no job is submitted by this artifact.",
+  "cluster": {
+    "nodes": 16,
+    "gpus_per_node": 8,
+    "total_gpus": 128,
+    "gpu_type": "B300",
+    "ray_address": "<VERIFIED_RAY_ADDRESS>",
+    "ray_dashboard_address": "<VERIFIED_RAY_DASHBOARD_ADDRESS>",
+    "container_image_digest": "<IDENTICAL_VERIFIED_IMAGE_DIGEST_ON_ALL_NODES>",
+    "network_and_collective_configuration": "<CLUSTER_OWNER_VERIFIED_CONFIGURATION>",
+    "usable_gpu_memory_and_host_ram_per_node": "<MEASURED_CAPACITY>"
+  },
+  "inputs": {
+    "hf_checkpoint": "<SHARED_KIMI_K3_HF_DIRECTORY>",
+    "prepared_relax_dataset": "<APPROVED_CONVERTED_RELAX_JSONL>",
+    "media_manifest": "<VERIFIED_LOCAL_MEDIA_MANIFEST>",
+    "source_and_conversion_manifest": "<SOURCE_HASH_OUTPUT_HASH_AND_REJECTION_MANIFEST>",
+    "checkpoint_directory": "<PERSISTENT_CHECKPOINT_DIRECTORY>",
+    "evidence_note": "The current conversion review reports 21258 accepted rows. This is provenance evidence only, not a batch size, rollout count, epoch limit, or proof that all original source rows were accepted. Resolve rejection disposition and verify the selected output hash before training."
+  },
+  "model_contract": {
+    "architecture": "KimiK3ForConditionalGeneration",
+    "decoder_layers": 93,
+    "hidden_size": 7168,
+    "attention_heads": 96,
+    "kda_heads": 96,
+    "routed_experts": 896,
+    "experts_selected_per_token": 16,
+    "source_expert_format": "MXFP4 packed weights with E8M0 scales, group size 32",
+    "training_expert_parameters": "BF16 after native Kimi K3 Bridge dequantization",
+    "rollout_expert_parameters": "Native MXFP4 pairs produced by the matching Bridge weight update path",
+    "source_identity_requirement": "Pin config, tokenizer, encoding, processor, weight index and all referenced shards; CPU source validation is not a complete weight-content or GPU-load validation."
+  },
+  "reference_topology": {
+    "status": "source_backed_candidate_not_target_cluster_accepted",
+    "source_recipe": "examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh",
+    "mode": "colocated_actor_and_rollout",
+    "physical_gpu_count": 128,
+    "actor": {
+      "tensor_parallel": 4,
+      "pipeline_parallel": 4,
+      "pipeline_layer_counts": [
+        21,
+        24,
+        24,
+        24
+      ],
+      "context_parallel": 2,
+      "data_parallel": 4,
+      "expert_parallel": 32,
+      "expert_tensor_parallel": 1,
+      "expert_data_parallel": 1,
+      "experts_per_rank_per_moe_layer": 28,
+      "sequence_parallel": true,
+      "vision_training": "The reference GRPO recipe trains vision; capacity and numerical validation remain required.",
+      "context_partition": "fixed zigzag; headwise or chunkwise KDA",
+      "dispatcher": "alltoall",
+      "activation_recomputation": "full, uniform, one layer",
+      "constraints": [
+        "128 / PP4 = TP4 * CP2 * DP4 = EP32 * ETP1 * expert-DP1 = 32",
+        "896 / EP32 = 28 routed experts per rank per MoE layer",
+        "93 = 21 + 24 + 24 + 24 decoder layers",
+        "96 KDA heads / (TP4 * CP2) = 12, satisfying headwise CP divisibility",
+        "TP greater than 1 requires sequence parallelism",
+        "No dynamic CP, allgather CP, virtual pipeline parallelism or MTP",
+        "vision-dp-when-tp requires a frozen vision model and cannot be added to joint vision training"
+      ]
+    },
+    "rollout": {
+      "engines": 8,
+      "gpus_per_engine": 16,
+      "nodes_per_engine": 2,
+      "attention_tensor_parallel": 8,
+      "attention_data_parallel": 2,
+      "expert_parallel": 16,
+      "moe_runner": "flashinfer_mxfp4",
+      "moe_a2a_backend": "none",
+      "initial_load": "Reference recipe uses dummy initialization followed by a complete actor weight push before requests.",
+      "placement_note": "The two-node engine placement and communication path require target-cluster validation; this plan does not supply hostnames or network interfaces."
+    },
+    "reward_gpu_allocation": null,
+    "reward_allocation_note": "The 128 GPUs cover colocated actor and rollout. An external RM or service needs separately approved capacity; no RM allocation is inferred."
+  },
+  "runtime_requirements": {
+    "megatron_bridge": "Installed Kimi K3 Bridge must support packed-expert dequantization, source-scale-compatible requantization, and Relax visual mappings.",
+    "sglang": "Verify the exact running version and reload patch on every rollout node. Current docker/Dockerfile.cu13 pins SGLang 0.5.21 and docker/patch/sglang/v0.5.21.patch; older K3 prose mentioning 0.5.17 is not image evidence.",
+    "cuda_stack": "Verify B300-compatible driver, CUDA, PyTorch, TE, FlashInfer, FLA, NCCL and compiled kernels in the chosen image; CPU tests do not establish compatibility.",
+    "training_forward": "Reference RL recipe enables OPEN_TRAINING_MXFP4_FAKE_QAT_FLAG=1 and FLA_TILELANG=0 in training workers.",
+    "cpu_optimizer": {
+      "reference_offload_fraction": 0.9,
+      "reference_settings": [
+        "optimizer CPU offload",
+        "selective offload",
+        "overlapped CPU optimizer D2H/H2D",
+        "precision-aware optimizer",
+        "BF16 main gradients",
+        "unpinned CPU parameters and gradients",
+        "disabled extra weight backup"
+      ],
+      "acceptance": "Measure per-node host RAM, pinned memory, CPU optimizer staging and GPU peaks during HF load, step zero, hot update and checkpoint save. The neighboring full SFT recipe estimates about 39 TB total state at 14 bytes per parameter with full offload; this is a rough warning, not a measured requirement for this plan."
+    },
+    "checkpointing": "The AgentSpark recipe saves optimizer state; fresh-job restoration of optimizer/scheduler/RNG/data progress still requires target-cluster acceptance.",
+    "bounded_save": "Confirm the installed Megatron bounded synchronous save staging patch before relying on its memory limits."
+  },
+  "required_service_and_reward_fields": {
+    "agentspark_base_url": "<VERIFIED_FULL_SERVICE_PREFIX>",
+    "served_kimi_model_name": "<VERIFIED_SERVED_MODEL_NAME>",
+    "callback_bind_and_public_address": "<VERIFIED_AGENTSPARK_REACHABLE_CALLBACK_CONFIGURATION>",
+    "credentials_provider": "<APPROVED_RUNTIME_SECRET_PROVIDER_NO_INLINE_SECRETS>",
+    "service_capacity_and_deadlines": "<GROUP_WIDTH_CONCURRENCY_TIMEOUT_AND_REMOTE_CLEANUP_CONTRACT>",
+    "reward_implementation_or_endpoint": "Implemented frozen-source request/response adapter; provide a verified compatible external RM URL.",
+    "reward_schema_and_version": "Source-hashed formal V21 contract including prompt bundle fingerprint and judge model; generated by v21_reward pin.",
+    "reward_failure_policy": "Fail closed on HTTP, schema, identity, policy, prompt, judge or scoring failure; never turn failure into valid zero reward.",
+    "context_selection_and_token_credit": "Implemented production segment terminal exports + unique resp-state ownership + native-Sample K3 visible token credit + logical group normalization.",
+    "training_export_adapter": "examples.agentspark_agentic.production; complete stream and verified real reward required before atomic explicit SessionOutput publication."
+  },
+  "dataset_execution_policy": {
+    "status": "IMPLEMENTED_DEFAULTS_OFFLINE_VALIDATED",
+    "epoch_count": 1,
+    "rollout_count": 1181,
+    "prompt_batch_size": 18,
+    "samples_per_prompt": 4,
+    "logical_global_batch_size": 72,
+    "final_batch_policy": "Require exact divisibility; never wrap a partial last batch into next epoch.",
+    "maximum_full_context_tokens": 131072,
+    "maximum_generated_tokens": 8192,
+    "reference_only": "Defaults belong to the AgentSpark full-data recipe, not the neighboring OpenR1-MM example.",
+    "coverage_requirements": [
+      "Define complete-dataset coverage using approved input row identities, including the treatment of source rejections and runtime failures.",
+      "Resolve epoch count, shuffling, final partial batch, retry and resume policies before deriving rollout count.",
+      "Current Controller epoch resolution floors dataset length divided by prompt batch size; current traditional data source fills a short batch from the next epoch. Neither behavior alone establishes an exact full pass.",
+      "Keep logical Sample.index and group_index distinct from multiple physical context export rows; do not multiply optimizer batch size by the number of exported contexts.",
+      "GRPO group width must match reward and service-capacity contracts. No constant or fabricated reward is allowed.",
+      "Measure complete AgentSpark context after system prompts, tools, Replay, images and generated history. Current-query-only token lengths do not bound that context."
+    ]
+  },
+  "blocking_acceptance_gates": [
+    "Identical verified image and model/media visibility on all 16 nodes; valid 128-GPU placement and collectives.",
+    "Full HF shard loading and BF16 training allocation on the target cluster, with measured host/GPU memory.",
+    "Finite losses, gradients and optimizer changes; matching policy version and real MXFP4 updates across all eight rollout engines.",
+    "Actual text, tools and images through the live AgentSpark service without losing raw generated token IDs or log probabilities.",
+    "Checkpoint save and fresh-job restoration of training and data progress, not only model weights."
+  ],
+  "validation_entrypoints_and_limits": {
+    "native_reference_rl": "examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh is an OpenR1-MM recipe, not an AgentSpark dataset launcher.",
+    "reduced_model_rl": "scripts/training/text/run-kimi-k3-5l-8xgpu-grpo.sh requires a different five-layer checkpoint and cannot validate full-model memory or loading.",
+    "standalone_sglang": "examples/models/kimi-k3/tools/validate_kimi_k3_sglang.py validates a single Ray actor with num_gpus equal to tp_size; it is not a two-node 16-GPU engine or 128-GPU training acceptance harness.",
+    "cpu_native_exports": "tests/cpu/examples/agentspark_agentic/test_native_exports.py verifies actual Service/Forest export boundaries using controlled generated payloads; it does not load full weights or establish live reward/training behavior.",
+    "production_recipe": "scripts/training/agentic/run-kimi-k3-agentspark-v21-128b300.sh; CPU/dry-run validated, no GPU job submitted in this implementation.",
+    "v21_cpu_integration": "Real local K3 native committed exports -> pinned frozen V21 source -> transfer converter -> CPU differentiable loss; generation and RM responses controlled."
+  },
+  "source_references": [
+    "scripts/models/kimi-k3.sh",
+    "relax/models/kimi_k3/provider.py",
+    "relax/models/kimi_k3/bridge.py",
+    "relax/backends/megatron/fake_qat_mxfp4.py",
+    "examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell-grpo.sh",
+    "examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xblackwell.sh",
+    "docker/Dockerfile.cu13",
+    "relax/core/controller.py",
+    "relax/engine/rollout/data_source.py",
+    "examples/agentspark_agentic/README.md",
+    "examples/agentspark_agentic/contexts.py",
+    "examples/agentspark_agentic/TRAINING.md",
+    "examples/agentspark_agentic/v21_reward.py",
+    "examples/agentspark_agentic/v21_training.py",
+    "examples/agentspark_agentic/v21_loss.py"
+  ]
+}

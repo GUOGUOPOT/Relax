@@ -38,6 +38,7 @@ try:
 except ImportError:
     pq = None
 
+from relax.utils.data.kimi_k3 import is_kimi_k3_tokenizer
 from relax.utils.multimodal.config import MultimodalConfig
 from relax.utils.opd.opd_utils import build_opd_teacher_sample_fields
 from relax.utils.types import MultimodalTypes, Sample
@@ -477,6 +478,7 @@ def check_sample_length(
     Returns:
         True if sample is valid (not too long), False otherwise
     """
+    kimi_k3 = is_kimi_k3_tokenizer(tokenizer)
     try:
         tools = sample.metadata.get("tools") if isinstance(sample.metadata, dict) else None
         # Honor per-sample apply_chat_template_kwargs (same merge as process_raw_sample)
@@ -485,6 +487,55 @@ def check_sample_length(
             sample.metadata.get("apply_chat_template_kwargs") if isinstance(sample.metadata, dict) else None
         )
         merged_chat_template_kwargs = {**(apply_chat_template_kwargs or {}), **(per_sample_kwargs or {})}
+        if kimi_k3:
+            from relax.utils.data.kimi_k3 import (
+                compile_kimi_k3_agentic_messages,
+                encode_kimi_k3_rollout_prompt,
+                order_kimi_k3_agentic_messages,
+            )
+
+            media = dict(sample.multimodal_inputs or {})
+            if any(media.get(key) for key in ("videos", "audio", "audios")):
+                raise ValueError("Kimi K3 length checking currently supports images only.")
+            images = list(media.get("images") or [])
+            if images:
+                from relax.utils.multimodal.image_utils import load_image
+
+                images = media["images"] = [load_image(image) for image in images]
+            if isinstance(sample.prompt, list):
+                # Preserve native structural/literal tokens and match Agentic's
+                # training-side image expansion, including native tool order.
+                messages, media, _ = order_kimi_k3_agentic_messages(tokenizer, sample.prompt, media, None)
+                input_ids, _, _ = compile_kimi_k3_agentic_messages(
+                    tokenizer,
+                    processor,
+                    messages,
+                    tools=tools,
+                    chat_template_kwargs=merged_chat_template_kwargs,
+                    multimodal_inputs=media,
+                )
+            elif isinstance(sample.prompt, str):
+                # Already rendered strings use the existing standard rollout
+                # text/medias contract; do not reconstruct chat structure.
+                input_ids = encode_kimi_k3_rollout_prompt(tokenizer, sample.prompt, len(images))
+                if images:
+                    if processor is None:
+                        raise ValueError("Kimi K3 image length checking requires its checkpoint processor.")
+                    from relax.utils.data.processing_utils import (
+                        adapt_processor_kwargs,
+                        expand_kimi_k25_placeholders,
+                        remap_mm_train_inputs,
+                    )
+
+                    output = processor(text=sample.prompt, **adapt_processor_kwargs(processor, media))
+                    input_ids = expand_kimi_k25_placeholders(
+                        processor,
+                        output["input_ids"][0].tolist(),
+                        remap_mm_train_inputs(processor, {"grid_thws": output["grid_thws"]}),
+                    )
+            else:
+                raise ValueError("Kimi K3 length checking requires text or message-list prompts.")
+            return len(input_ids) <= max_length
         if isinstance(sample.prompt, str):
             prompt_text = sample.prompt
             input_ids = None
@@ -524,7 +575,9 @@ def check_sample_length(
 
     except Exception as e:
         logger.warning(f"Error checking length: {e}")
-        return True
+        # A failed K3 encoding cannot establish that the sample fits. Keep the
+        # existing fallback for other tokenizers outside this model-specific fix.
+        return not kimi_k3
 
 
 # Global variables for multiprocessing workers (required for ProcessPoolExecutor initializer)
@@ -586,7 +639,7 @@ def filter_long_prompts(
     if not samples:
         return samples
 
-    if not isinstance(samples[0].prompt, (str, list)):
+    if not isinstance(samples[0].prompt, (str, list)) and not is_kimi_k3_tokenizer(tokenizer):
         logger.warning("Skipping max_length check for unsupported prompt type.")
         return samples
 
@@ -616,7 +669,8 @@ def filter_long_prompts(
                             logger.debug(f"Filtered sample exceeding max_length={max_length}")
                     except Exception as e:
                         logger.warning(f"Error checking sample length: {e}")
-                        filtered_samples.append(futures[future])
+                        if not is_kimi_k3_tokenizer(tokenizer):
+                            filtered_samples.append(futures[future])
         else:
             filtered_samples = []
             for sample in tqdm.tqdm(samples, desc="check sample length..."):
@@ -631,7 +685,9 @@ def filter_long_prompts(
                 else:
                     logger.debug(f"Filtered sample exceeding max_length={max_length}")
     else:
-        if isinstance(samples[0].prompt, list):
+        if isinstance(samples[0].prompt, list) or is_kimi_k3_tokenizer(tokenizer):
+            # K3 must validate media slots and unsupported prompts even without
+            # a processor; the generic text batch fast path cannot do that.
             filtered_samples = []
             for sample in samples:
                 if check_sample_length(

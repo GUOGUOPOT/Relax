@@ -47,6 +47,7 @@ from relax.utils.memory_utils import available_memory, clear_memory, collect_man
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
 from relax.utils.timer import timer
+from relax.utils.training.loss_extensions import custom_loss_fields
 from relax.utils.training.nonfinite_grad import (
     NonFiniteGradientNormError,
     configure_nonfinite_guard,
@@ -601,9 +602,11 @@ def setup_model_and_optimizer(
     _validate_vit_lr_trainable_params(args, model)
 
     if args.optimizer_cpu_offload:
+        from .bounded_cpu_optimizer import patch_hdo_bounded_cpu_grads
         from .compat import patch_hdo_group_steps
 
         patch_hdo_group_steps()
+        patch_hdo_bounded_cpu_grads()
 
     optimizer = get_megatron_optimizer(
         config=config,
@@ -1334,6 +1337,7 @@ def train_one_step(
                     "sample_index_mask_sums",
                     "pre_shifted_labels",
                     *_opd_keys,
+                    *custom_loss_fields(args),
                 ],
                 args.data_pad_size_multiplier,
                 args.qkv_format,

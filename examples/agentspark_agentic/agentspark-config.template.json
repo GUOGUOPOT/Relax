@@ -1,0 +1,19 @@
+{
+  "base_url": "<AGENTSPARK_SERVICE_BASE_URL_WITH_OPTIONAL_PREFIX>",
+  "model": "<SERVED_MODEL_ALIAS>",
+  "agent": "<AGENTSPARK_AGENT_NAME>",
+  "source": "eden",
+  "max_tokens": "<POSITIVE_INTEGER_PER_TURN_TOKEN_LIMIT>",
+  "callback_bind_host": "<LOCAL_CALLBACK_LISTEN_ADDRESS>",
+  "callback_bind_port": "<INTEGER_CALLBACK_LISTEN_PORT>",
+  "callback_public_base_url": "<AGENTSPARK_REACHABLE_CALLBACK_BASE_URL_WITH_OPTIONAL_PREFIX>",
+  "connect_timeout_s": 10,
+  "read_timeout_s": null,
+  "cleanup_timeout_s": 2,
+  "max_callback_bytes": 67108864,
+  "media_allowed_roots": [
+    "/ABSOLUTE/MOUNTED/IMAGE_ROOT_1",
+    "/ABSOLUTE/MOUNTED/IMAGE_ROOT_2",
+    "/ABSOLUTE/MOUNTED/IMAGE_ROOT_3"
+  ]
+}

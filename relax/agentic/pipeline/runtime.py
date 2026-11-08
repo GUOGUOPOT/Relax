@@ -36,6 +36,12 @@ from relax.agentic.pipeline import (
 )
 from relax.agentic.profile import mark_sample_agentic_event
 from relax.agentic.session.state import check_messages
+from relax.utils.data.kimi_k3 import (
+    compile_kimi_k3_agentic_messages,
+    is_kimi_k3_tokenizer,
+    kimi_k3_observation_prefix,
+    order_kimi_k3_agentic_messages,
+)
 from relax.utils.http_utils import get, init_http_client, is_expected_sglang_499, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
@@ -163,6 +169,35 @@ def _normalize_multimodal_inputs_sync(
     ), {"process_vision_info_elapsed_s": time.monotonic() - started_at}
 
 
+def _normalize_kimi_k3_images_sync(
+    multimodal_inputs: dict[str, Any] | None, multimodal_config: Any | None
+) -> tuple[dict[str, Any] | None, dict[str, float]]:
+    if not multimodal_inputs:
+        return None, {}
+    defaults = MultimodalConfig()
+    for name in ("image_max_token_num", "image_min_token_num", "image_resize_scale_factor"):
+        if multimodal_config is not None and getattr(multimodal_config, name, getattr(defaults, name)) != getattr(
+            defaults, name
+        ):
+            raise ValueError(
+                f"Kimi K3 image sizing belongs to its checkpoint processor; unsupported override: {name}."
+            )
+    from relax.utils.multimodal.image_utils import load_image
+
+    started_at = time.monotonic()
+    media = dict(multimodal_inputs)
+    media["images"] = [load_image(image) for image in media.get("images") or []]
+    return media, {"process_vision_info_elapsed_s": time.monotonic() - started_at}
+
+
+def _encode_kimi_k3_image_for_backend_sync(image: Any) -> str:
+    # Preserve alpha and original dimensions. K3 owns resizing and background
+    # composition in its checkpoint processor on both training and backend sides.
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
 @dataclass
 class EncodedMessages:
     """Compiler output consumed by SessionForest and the generation backend."""
@@ -214,6 +249,8 @@ class SGLangMessageCompiler:
         self.use_audio_in_video = use_audio_in_video
         self.multimodal_config = multimodal_config
         self.cpu_executor = cpu_executor
+        self._is_kimi_k3 = is_kimi_k3_tokenizer(tokenizer)
+        self.requires_observation_history = self._is_kimi_k3
 
     def _build_prompt_sync(
         self,
@@ -369,7 +406,8 @@ class SGLangMessageCompiler:
         )
 
         loop = asyncio.get_running_loop()
-        tasks = [loop.run_in_executor(self.cpu_executor, encode_image_for_rollout_engine, image) for image in images]
+        encode_image = _encode_kimi_k3_image_for_backend_sync if self._is_kimi_k3 else encode_image_for_rollout_engine
+        tasks = [loop.run_in_executor(self.cpu_executor, encode_image, image) for image in images]
         tasks.extend(
             loop.run_in_executor(
                 self.cpu_executor,
@@ -402,6 +440,56 @@ class SGLangMessageCompiler:
         audio_data = list(results[offset:])
         return image_data, audio_data, video_data, {"media_encode_elapsed_s": time.monotonic() - started_at}
 
+    async def _encode_kimi_k3_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None,
+        chat_template_kwargs: dict[str, Any] | None,
+        multimodal_inputs: dict[str, Any] | None,
+        prefix_messages: list[dict[str, Any]] | None,
+    ) -> EncodedMessages:
+        started_at = time.monotonic()
+        if any((multimodal_inputs or {}).get(key) for key in ("videos", "audio", "audios")):
+            raise ValueError("Kimi K3 Agentic encoding currently supports images only.")
+        messages, multimodal_inputs, prefix_messages = order_kimi_k3_agentic_messages(
+            self.tokenizer, messages, multimodal_inputs, prefix_messages
+        )
+        loop = asyncio.get_running_loop()
+        normalized_media, media_timing = await loop.run_in_executor(
+            self.cpu_executor, _normalize_kimi_k3_images_sync, multimodal_inputs, self.multimodal_config
+        )
+        # K3's native encoder must see structured messages together with the
+        # processor's image prompts. The generic rendered-text worker cannot
+        # preserve literal versus structural XTML tokens.
+        compiled, encoded_media = await asyncio.gather(
+            loop.run_in_executor(
+                self.cpu_executor,
+                partial(
+                    compile_kimi_k3_agentic_messages,
+                    self.tokenizer,
+                    self.processor,
+                    messages,
+                    tools=tools,
+                    chat_template_kwargs=chat_template_kwargs,
+                    multimodal_inputs=normalized_media,
+                    prefix_messages=prefix_messages,
+                ),
+            ),
+            self._encode_media_async(normalized_media),
+        )
+        train_ids, backend_ids, train_inputs = compiled
+        image_data, audio_data, video_data, encode_timing = encoded_media
+        return EncodedMessages(
+            train_prompt_ids=train_ids,
+            backend_prompt_ids=backend_ids,
+            backend_image_data=image_data,
+            backend_audio_data=audio_data,
+            backend_video_data=video_data,
+            multimodal_train_inputs=train_inputs,
+            timing={**media_timing, **encode_timing, "total_elapsed_s": time.monotonic() - started_at},
+        )
+
     async def _encode_with_prompt_builder(
         self,
         messages: list[dict[str, Any]],
@@ -413,7 +501,16 @@ class SGLangMessageCompiler:
             [list[dict[str, Any]], list[dict[str, Any]] | None, dict[str, Any] | None],
             tuple[str, list[int], int, dict[str, float]],
         ],
+        prefix_messages: list[dict[str, Any]] | None = None,
     ) -> EncodedMessages:
+        if self._is_kimi_k3:
+            return await self._encode_kimi_k3_messages(
+                messages,
+                tools=tools,
+                chat_template_kwargs=chat_template_kwargs,
+                multimodal_inputs=multimodal_inputs,
+                prefix_messages=prefix_messages,
+            )
         total_started_at = time.monotonic()
         loop = asyncio.get_running_loop()
         prompt_future = loop.run_in_executor(
@@ -502,13 +599,18 @@ class SGLangMessageCompiler:
         tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any] | None = None,
         multimodal_inputs: dict[str, Any] | None = None,
+        history_messages: list[dict[str, Any]] | None = None,
     ) -> EncodedMessages:
+        prefix = _DUMMY_MESSAGES
+        if self._is_kimi_k3 and history_messages:
+            prefix = kimi_k3_observation_prefix(history_messages, _DUMMY_MESSAGES)
         return await self._encode_with_prompt_builder(
             messages_delta,
             tools=tools,
             chat_template_kwargs=chat_template_kwargs,
             multimodal_inputs=multimodal_inputs,
             prompt_builder=self._build_observation_prompt_sync,
+            prefix_messages=prefix,
         )
 
 

@@ -20,6 +20,7 @@ from transformers import AutoConfig
 from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.model_source import ModelSource
+from relax.utils.training.loss_extensions import custom_loss_supports_static_cp_sample_mean
 
 
 __all__ = ["validate_args", "megatron_parse_args", "set_default_megatron_args"]
@@ -208,11 +209,12 @@ def validate_args(args):
             "pipeline_model_parallel_size is 1."
         )
 
-    # Megatron-Bridge requires --calculate-per-token-loss when context parallelism is enabled.
-    # See https://github.com/NVIDIA-NeMo/Megatron-Bridge
+    # Keep token normalization as the default CP contract. An explicitly capable
+    # custom loss may preserve sample-mean normalization under static CP.
     if args.context_parallel_size > 1 or getattr(args, "dynamic_context_parallel", False):
-        assert args.calculate_per_token_loss, (
-            "--calculate-per-token-loss must be set when context_parallel_size > 1 or dynamic_context_parallel is enabled (required by Megatron-Bridge)."
+        assert args.calculate_per_token_loss or custom_loss_supports_static_cp_sample_mean(args), (
+            "--calculate-per-token-loss is required for context parallelism unless the custom loss explicitly "
+            "supports synchronous, colocated static-CP sample-mean normalization."
         )
 
     _validate_linear_cp_mode(args)

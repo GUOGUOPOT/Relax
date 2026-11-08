@@ -30,6 +30,7 @@ from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
 from relax.utils.training.data_fields import PREFERENCE_DATA_FIELDS
 from relax.utils.training.flops_counter import FlopsCounter
+from relax.utils.training.loss_extensions import custom_loss_fields
 from relax.utils.training.preference_utils import pack_preference_pair_indices
 from relax.utils.types import RolloutBatch
 
@@ -1506,7 +1507,12 @@ def log_rollout_data(
             or getattr(args, "uses_unsplit_forward", False),
         )
 
+        extension_fields = custom_loss_fields(args)
         for key, val in rollout_data.items():
+            # Extension columns own their masks/denominators and report through
+            # their loss. A generic per-row mean would mislabel CP metrics.
+            if key in extension_fields:
+                continue
             if is_sft and key in ("response_lengths", "total_lengths", "learn_lengths", "non_learn_lengths"):
                 continue
             if key in [

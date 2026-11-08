@@ -28,6 +28,7 @@ from relax.utils.opd.opd_utils import (
 )
 from relax.utils.replay import capture_hooks
 from relax.utils.training.fused_ce import ce_implementation, te_cross_entropy
+from relax.utils.training.loss_extensions import PolicyLossContext, PolicyLossExtension, validate_addon
 from relax.utils.training.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
@@ -434,9 +435,9 @@ def get_log_probs_and_entropy(
             dynamic_cp_rank=dynamic_cp_rank,
         )
     if lm_head_forward is not None:
-        assert not with_entropy and not with_topk, (
-            "lm_head_forward chunked path doesn't materialize full vocab — entropy/topk unavailable."
-        )
+        assert (
+            not with_entropy and not with_topk
+        ), "lm_head_forward chunked path doesn't materialize full vocab — entropy/topk unavailable."
         unfused_wgrad = getattr(lm_head_forward, "_relax_unfused_head_wgrad", False)
         if getattr(args, "recompute_loss_function", False) and not unfused_wgrad:
             if not getattr(args, "recompute_loss_function_use_reentrant", True):
@@ -822,9 +823,9 @@ def compute_advantages_and_returns(
 
             all_masks = torch.cat(mask_chunks)
 
-        assert all_advs.size() == all_masks.size(), (
-            f"Shape mismatch before whitening: advantages {all_advs.size()}, masks {all_masks.size()}"
-        )
+        assert (
+            all_advs.size() == all_masks.size()
+        ), f"Shape mismatch before whitening: advantages {all_advs.size()}, masks {all_masks.size()}"
         # Which normalisation to apply is declared by the algorithm registry.
         # This used to be a set of estimator names maintained here and a second
         # identical set in `policy_loss_function` below, which is exactly the
@@ -958,6 +959,8 @@ def policy_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    extension: PolicyLossExtension | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute policy loss (PPO/GSPO/SAPO) and metrics.
 
@@ -1124,13 +1127,36 @@ def policy_loss_function(
         ppo_kl = old_log_probs - log_probs
         policy_kwargs["score_centering_context"] = sc_context
 
-    pg_loss, pg_clipfrac, policy_scalar_metrics = compute_policy_loss_for(
-        args,
-        log_probs=log_probs,
-        ppo_kl=ppo_kl,
-        advantages=advantages,
-        **policy_kwargs,
-    )
+    active_tokens = None
+    if extension is not None:
+        local_masks = [
+            slice_log_prob_with_cp(
+                mask,
+                total,
+                response,
+                args.qkv_format,
+                max_seq_lens[i] if max_seq_lens is not None else None,
+                padded_total_length=padded_total_lengths[i] if padded_total_lengths is not None else None,
+                dynamic_cp_size=batch.get("dynamic_cp_size"),
+                dynamic_cp_rank=batch.get("dynamic_cp_rank"),
+            )
+            for i, (mask, total, response) in enumerate(
+                zip(batch["loss_masks"], total_lengths, response_lengths, strict=True)
+            )
+        ]
+        active_tokens = torch.cat(local_masks).bool()
+        ppo_kl = torch.where(active_tokens, torch.nan_to_num(ppo_kl, nan=0.0, posinf=0.0, neginf=0.0), 0)
+        advantages = torch.where(active_tokens, torch.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0), 0)
+        pg_loss, pg_clipfrac = extension.policy_loss(args, ppo_kl, advantages)
+        policy_scalar_metrics = {}
+    else:
+        pg_loss, pg_clipfrac, policy_scalar_metrics = compute_policy_loss_for(
+            args,
+            log_probs=log_probs,
+            ppo_kl=ppo_kl,
+            advantages=advantages,
+            **policy_kwargs,
+        )
 
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
@@ -1191,6 +1217,25 @@ def policy_loss_function(
                 sum_of_sample_mean, modified_response_masks
             )
 
+    addon = None
+    if extension is not None:
+        corrected = not is_score_centering and (args.get_mismatch_metrics or args.use_tis)
+        addon = extension.auxiliary_loss(
+            args,
+            batch,
+            PolicyLossContext(
+                ppo_kl=ppo_kl,
+                log_probs=log_probs,
+                old_log_probs=old_log_probs,
+                reference_log_probs=batch.get("ref_log_probs"),
+                active_tokens=active_tokens,
+                opsm_mask=opsm_mask if args.use_opsm else None,
+                tis_function=tis_func if corrected else None,
+                tis_kwargs=tis_kwargs if corrected else {},
+            ),
+        )
+        validate_addon(addon)
+
     # Determine pg_loss reducer: use custom if specified, otherwise default
     if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
         custom_pg_loss_reducer_func = load_function(args.custom_pg_loss_reducer_function_path)
@@ -1209,14 +1254,22 @@ def policy_loss_function(
     ppo_kl = sum_of_sample_mean(ppo_kl)
 
     # entropy loss
-    entropy = log_probs_and_entropy["entropy"]
-    entropy = torch.cat(entropy, dim=0)
+    entropy = torch.cat(log_probs_and_entropy["entropy"], dim=0)
     if is_score_centering:
         entropy = torch.where(sc_valid, entropy, 0)
+    # Preserve real entropy for trajectory capture while honoring an extension's
+    # disabled diagnostic; in particular, never attach 0 * NaN to its loss.
+    if extension is not None and args.entropy_coef == 0 and not getattr(args, "observe_training_entropy", False):
+        entropy_loss = pg_loss.new_zeros(())
+    else:
+        entropy_loss = sum_of_sample_mean(entropy)
 
-    entropy_loss = sum_of_sample_mean(entropy)
-
-    loss = pg_loss - args.entropy_coef * entropy_loss
+    loss = pg_loss if extension is not None and args.entropy_coef == 0 else pg_loss - args.entropy_coef * entropy_loss
+    if addon is not None:
+        for term in addon.policy_terms:
+            loss = loss + term
+        if addon.reference_terms and not args.use_kl_loss:
+            raise ValueError("Auxiliary reference KL requires use_kl_loss")
 
     if args.use_kl_loss:
         ref_log_probs = batch["ref_log_probs"]
@@ -1229,14 +1282,15 @@ def policy_loss_function(
             importance_ratio = None
             if args.use_unbiased_kl:
                 importance_ratio = torch.exp(log_probs - old_log_probs)
-            kl = compute_approx_kl(
-                log_probs,
-                ref_log_probs,
-                kl_loss_type=args.kl_loss_type,
-                importance_ratio=importance_ratio,
-            )
+            kl_fn = extension.approximate_kl if extension is not None else compute_approx_kl
+            kl = kl_fn(log_probs, ref_log_probs, kl_loss_type=args.kl_loss_type, importance_ratio=importance_ratio)
+            if extension is not None:
+                kl = torch.where(active_tokens, torch.nan_to_num(kl, nan=0.0, posinf=0.0, neginf=0.0), 0)
             kl_loss = sum_of_sample_mean(kl)
 
+        if addon is not None:
+            for term in addon.reference_terms:
+                loss = loss + term
         if args.kl_loss_coef != 0:
             loss = loss + args.kl_loss_coef * kl_loss
 
@@ -1331,6 +1385,10 @@ def policy_loss_function(
     if duplicate_policy_metrics:
         raise ValueError(f"Policy scalar metrics would overwrite existing metrics: {sorted(duplicate_policy_metrics)}")
     reported_loss.update(policy_scalar_metrics)
+    if addon is not None:
+        if reported_loss.keys() & addon.metrics.keys():
+            raise ValueError("Auxiliary metrics conflict with native policy metrics")
+        reported_loss.update(addon.metrics)
 
     return loss, reported_loss
 

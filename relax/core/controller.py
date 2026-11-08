@@ -1681,13 +1681,10 @@ class Controller:
             # it exits immediately when control returns to _check_loop).
             if self._health_manager._checker is not None and hasattr(self._health_manager._checker, "_stop_event"):
                 self._health_manager._checker._stop_event.set()
-            # Report error and force-exit the entire process.
-            # os._exit is necessary because:
-            # 1. raise only exits the main thread; Ray Serve / daemon threads keep the process alive
-            # 2. The old HealthChecker thread would otherwise loop and re-trigger _global_restart
+            # The recovery wrapper cancels pending tasks and publishes this error
+            # to the training loop, which enters the entrypoint's bounded cleanup.
             self._report_error_to_metrics_service(RuntimeError(error_msg))
-            logger.error("Calling os._exit(1) to force-terminate the process")
-            os._exit(1)
+            raise RuntimeError(error_msg)
 
         # Save references needed after __init__ overwrites them
         config = self.config

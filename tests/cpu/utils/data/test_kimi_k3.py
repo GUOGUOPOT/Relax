@@ -263,7 +263,11 @@ def test_kimi_k3_official_encoder_preserves_tools_images_and_literal_tokens(offi
     )
     assert ids == expected
     learned = tokenizer.decode([token for token, learn in zip(ids, mask) if learn])
-    assert "answer" in learned and "1e2" in learned
+    assert "answer" in learned
+    # Numeric spelling belongs to the selected checkpoint encoder; retain the
+    # native ID equality and check the supervised argument's semantic value.
+    number = learned.split('argument key="x" type="number"<|sep|>', 1)[1].split("<|close|>", 1)[0]
+    assert json.loads(number) == 100
     assert "literal" not in learned and "image 32x48" not in learned
     assert "consider" in learned if thinking else "consider" not in learned
     assert learned.count("<|end_of_msg|>") == 2

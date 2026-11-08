@@ -329,7 +329,8 @@ def test_cancel_uses_the_matching_ray_api(native_ref):
         ray.cancel.assert_not_called()
 
 
-def test_failed_recovery_cancels_a_pending_serve_response_and_unblocks_training():
+@pytest.mark.parametrize("restart_limit", [None, 0, 3])
+def test_failed_recovery_cancels_a_pending_serve_response_and_unblocks_training(restart_limit):
     ctrl = controller_fixture()
     cls = load_methods(
         "relax/core/controller.py",
@@ -340,6 +341,23 @@ def test_failed_recovery_cancels_a_pending_serve_response_and_unblocks_training(
     ctrl._cancel_pending_tasks = cls._cancel_pending_tasks.__get__(ctrl)
     error = ValueError("failed before replica deletion")
     ctrl._restart_serve = Mock(side_effect=error)
+    reinitialize = Mock(side_effect=AssertionError("restart limit must not reinitialize"))
+    hard_exit = Mock(side_effect=AssertionError("restart limit must preserve cleanup"))
+    if restart_limit is not None:
+        cls = load_methods(
+            "relax/core/controller.py",
+            "Controller",
+            {"_run_global_restart"},
+            {
+                "logger": logging.getLogger(__name__),
+                "os": SimpleNamespace(_exit=hard_exit),
+                "recovery_load_path": reinitialize,
+            },
+        )
+        ctrl._global_restart_count = restart_limit
+        ctrl._max_global_restart = restart_limit
+        ctrl._run_global_restart = cls._run_global_restart.__get__(ctrl)
+        ctrl._restart_serve = lambda role: ctrl._run_global_restart()
 
     class Response:
         def __await__(self):
@@ -355,9 +373,21 @@ def test_failed_recovery_cancels_a_pending_serve_response_and_unblocks_training(
 
     response = Response()
     ctrl.serve_dict = {"actor": SimpleNamespace(run=lambda: response, role="actor")}
-    with pytest.raises(RuntimeError, match="global restart failed"):
+    with pytest.raises(RuntimeError, match="global restart failed") as caught:
         ctrl.training_loop()
-    ctrl._report_error_to_metrics_service.assert_called_once_with(error)
+    if restart_limit is None:
+        ctrl._report_error_to_metrics_service.assert_called_once_with(error)
+    else:
+        assert isinstance(caught.value.__cause__, RuntimeError)
+        assert f"maximum allowed ({restart_limit})" in str(caught.value.__cause__)
+        assert ctrl._global_restart_count == restart_limit + 1
+        assert ctrl._health_manager._checker._stop_event.is_set()
+        assert ctrl._pending_task_refs == []
+        assert response.future.cancelled()
+        assert not ctrl._restarting
+        assert ctrl._restart_consumed_event.is_set()
+        reinitialize.assert_not_called()
+        hard_exit.assert_not_called()
 
 
 @pytest.mark.parametrize("failure", ["unknown_role", "counter"])

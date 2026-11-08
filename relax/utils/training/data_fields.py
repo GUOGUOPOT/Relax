@@ -102,4 +102,10 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         from relax.utils.opd.opd_utils import consume_opd_train_data
 
         consume_opd_train_data(fields, args)
+    from relax.utils.training.loss_extensions import custom_loss_fields
+
+    for field in custom_loss_fields(args):
+        if field in fields:
+            raise ValueError(f"Custom loss column conflicts with native field: {field}")
+        fields.append(field)
     return fields

@@ -69,6 +69,7 @@ from relax.agentic.session.state import (
     normalize_template_kwargs,
     normalize_tools,
 )
+from relax.utils.data.kimi_k3 import is_kimi_k3_tokenizer
 from relax.utils.http_utils import is_router_no_available_workers
 from relax.utils.logging_utils import get_logger
 from relax.utils.types import get_spec_token_counts
@@ -214,10 +215,20 @@ def _decode_response_payload(
     token_ids: list[int],
     tools: list[dict[str, Any]],
     parent_state_hash: str,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     if not token_ids:
         raise RuntimeError("Generation backend returned a terminal response without output tokens")
-    text = str(tokenizer.decode(token_ids, skip_special_tokens=False))
+    parse_token_ids = token_ids
+    if is_kimi_k3_tokenizer(tokenizer):
+        # Only the parsing view omits terminal control IDs. Keep ordinary BPE
+        # spellings and the original IDs used by Forest, logprobs and call IDs.
+        end_of_message_id = tokenizer.convert_tokens_to_ids("<|end_of_msg|>")
+        end = len(token_ids)
+        while end and token_ids[end - 1] == end_of_message_id:
+            end -= 1
+        parse_token_ids = token_ids[:end]
+    text = str(tokenizer.decode(parse_token_ids, skip_special_tokens=False))
     if not text:
         raise RuntimeError("Tokenizer decoded non-empty output tokens to empty text")
     reasoning_text: Optional[str] = None
@@ -225,9 +236,13 @@ def _decode_response_payload(
     if reasoning_parser_name:
         from sglang.srt.parser.reasoning_parser import ReasoningParser
 
+        reasoning_options = {}
+        if str(reasoning_parser_name).lower() == "kimi_k3":
+            reasoning_options["force_reasoning"] = bool((chat_template_kwargs or {}).get("thinking", True))
         parsed_reasoning, parsed_text = ReasoningParser(
             model_type=str(reasoning_parser_name),
             stream_reasoning=False,
+            **reasoning_options,
         ).parse_non_stream(text)
         reasoning_text = parsed_reasoning if isinstance(parsed_reasoning, str) and parsed_reasoning else None
         text = parsed_text if isinstance(parsed_text, str) else ""
@@ -2183,11 +2198,18 @@ class AgenticSessionShard:
                 raise RuntimeGroupError(f"tools changed inside session subtree: {session.session_id}")
             if chat_template_kwargs != subtree_root.chat_template_kwargs:
                 raise RuntimeGroupError(f"chat template changed inside session subtree: {session.session_id}")
-            encoded = await self._generation_backend.compiler.encode_observation_delta(
+            compiler = self._generation_backend.compiler
+            history_kwargs = {}
+            if getattr(compiler, "requires_observation_history", False):
+                # Context-dependent encoders need committed tool-call metadata;
+                # the compiler returns only new observation tokens.
+                history_kwargs["history_messages"] = forest.full_messages(parent.state_hash)
+            encoded = await compiler.encode_observation_delta(
                 messages_delta,
                 tools=tools,
                 chat_template_kwargs=chat_template_kwargs,
                 multimodal_inputs=_multimodal_inputs_from_messages(messages_delta),
+                **history_kwargs,
             )
             abort_count = parent.abort_count
             node_tools = None
@@ -2676,6 +2698,7 @@ class AgenticSessionShard:
             token_ids=ir.pending_token_delta,
             tools=forest.subtree_tools(ir.parent_state_hash),
             parent_state_hash=ir.parent_state_hash,
+            chat_template_kwargs=forest.subtree_chat_template_kwargs(ir.parent_state_hash),
         )
         response_node = forest.append_resp(
             parent_state_hash=ir.parent_state_hash,

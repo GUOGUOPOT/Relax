@@ -1,7 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import argparse
+import multiprocessing
 import sys
+import time
 from dataclasses import make_dataclass
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
@@ -25,6 +27,8 @@ def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeyp
     wait = Mock(side_effect=lambda **_kwargs: events.append("wait"))
     monkeypatch.setattr(module, "multiprocessing", multiprocessing)
     monkeypatch.setattr(module, "_wait_server_healthy", wait)
+    kill = Mock()
+    monkeypatch.setattr(module, "kill_process_tree", kill)
     monkeypatch.setattr(module.os, "getpid", lambda: 123)
     monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", False, raising=False)
     monkeypatch.setattr(module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
@@ -45,6 +49,71 @@ def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeyp
     else:
         assert events == ["start"]
         wait.assert_not_called()
+    kill.assert_not_called()
+    process.join.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("failure", "alive", "cleanup_failure"),
+    [
+        (RuntimeError("unhealthy"), True, None),
+        (KeyboardInterrupt(), True, None),
+        (RuntimeError("child exited"), False, None),
+        (RuntimeError("unhealthy"), True, "kill"),
+        (KeyboardInterrupt(), True, "join"),
+    ],
+    ids=["health-failed", "interrupted", "already-exited", "kill-failed", "join-failed"],
+)
+def test_launch_server_failure_cleans_only_owned_process_and_preserves_error(
+    monkeypatch, sglang_engine_module, failure, alive, cleanup_failure
+):
+    module = sglang_engine_module
+    process = Mock(pid=123, is_alive=Mock(return_value=alive))
+    if cleanup_failure == "join":
+        process.join.side_effect = RuntimeError("join failed")
+    kill = Mock(side_effect=OSError("kill failed") if cleanup_failure == "kill" else None)
+    monkeypatch.setattr(
+        module, "multiprocessing", SimpleNamespace(set_start_method=Mock(), Process=Mock(return_value=process))
+    )
+    monkeypatch.setattr(module, "_wait_server_healthy", Mock(side_effect=failure))
+    monkeypatch.setattr(module, "kill_process_tree", kill)
+    monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", False, raising=False)
+    monkeypatch.setattr(module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
+    server_args = SimpleNamespace(node_rank=0, url=lambda: "http://worker:8000", api_key=None)
+
+    with pytest.raises(type(failure)) as caught:
+        module.launch_server_process(server_args)
+
+    assert caught.value is failure
+    process.start.assert_called_once_with()
+    if alive:
+        kill.assert_called_once_with(123)
+    else:
+        kill.assert_not_called()
+    process.join.assert_called_once_with(timeout=5.0)
+
+
+def test_failed_server_launch_reaps_its_cpu_process(monkeypatch, sglang_engine_module):
+    module = sglang_engine_module
+    process = multiprocessing.get_context("spawn").Process(target=time.sleep, args=(60,))
+    monkeypatch.setattr(
+        module, "multiprocessing", SimpleNamespace(set_start_method=Mock(), Process=Mock(return_value=process))
+    )
+    monkeypatch.setattr(module, "_wait_server_healthy", Mock(side_effect=RuntimeError("unhealthy")))
+    monkeypatch.setattr(module, "kill_process_tree", lambda pid: process.kill() if pid == process.pid else None)
+    monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", False, raising=False)
+    monkeypatch.setattr(module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
+    server_args = SimpleNamespace(node_rank=0, url=lambda: "http://worker:8000", api_key=None)
+    try:
+        with pytest.raises(RuntimeError, match="unhealthy"):
+            module.launch_server_process(server_args)
+        assert not process.is_alive()
+        assert process.exitcode is not None
+    finally:
+        if process.is_alive():
+            process.kill()
+        process.join(timeout=5)
+        process.close()
 
 
 @pytest.mark.parametrize(
