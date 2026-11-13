@@ -23,6 +23,40 @@ The current launch scripts use `ray job submit` and auto-source [`scripts/entryp
 | [`run-qwen3.5-35B-A3B-mtp-sft-16xgpu.sh`](../../../scripts/training/sft/run-qwen3.5-35B-A3B-mtp-sft-16xgpu.sh) | `OpenMathReasoning-mini` | `Qwen3.5-35B-A3B` | 16 GPU actor plus SFT producer | Advanced MTP SFT. Many knobs are exposed as environment variables. |
 | [`run-qwen3.5-9B-classification-sft-8xgpu.sh`](../../../examples/seq_cls_sft/run-qwen3.5-9B-classification-sft-8xgpu.sh) | SST-2, AG News, or GoEmotions | `Qwen3.5-9B` | 8 GPU actor plus SFT producer | Full-parameter binary, multiclass, or multilabel sequence-classification SFT. |
 | [`run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh`](../../../examples/seq_cls_sft/run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh) | SST-2, AG News, or GoEmotions | `Qwen3.5-35B-A3B` | 8 GPU actor plus SFT producer | LoRA sequence-classification SFT; defaults to GoEmotions. |
+| [`run-qwen38-flash-next-fp8-32xgpu.sh`](../../../scripts/training/sft/run-qwen38-flash-next-fp8-32xgpu.sh) | User-provided messages, tools, and images | `Qwen3.8-Flash-Next` | 32 GPU actor across four nodes plus SFT producer | Backbone MoE MXFP8 with trainable PLE, vision, and MTP. Uses an existing Ray cluster. |
+
+## Qwen3.8 Flash Next: MoE FP8 with trainable PLE, vision, and MTP
+
+This recipe uses Blackwell MXFP8 for the backbone's routed and shared expert GEMMs. Primary parameters remain BF16, with FP32 master weights and gradient accumulation. GDN, QSA, PLE, vision, and MTP retain their original compute precision. This boundary matters: a TP4 GDN projection has local width 4120, which does not satisfy MXFP8's 32-element alignment.
+
+The complete PLE n-gram table and its projections are trainable. The script disables both PLE CPU offload, which stores the table as a buffer, and the streamed PLE path that requires frozen parameters. Vision encoder and projector remain trainable. One MTP layer uses loss scaling 0.1 with `--mtp-detach-paths none`. Only the QSA indexers are frozen, as required by the Mixed Stage-1 attention path.
+
+Use a compatible Megatron/Bridge image containing the Qwen4Exp model, HybridEP, and MCore's TE per-module precision API. The script uses TP4/PP4/CP1/EP8/ETP1, sequence parallelism, and layout `Et*6|t*14|t*14|t*14mL`. The shorter first stage leaves room for the PLE table and vision tower. QSA uses the Grouped long-document backend; this layout does not use the TP2-only cuDNN QSA adapter. See [Qwen3.8 QSA](./qwen38-qsa.md) for attention details.
+
+Megatron must also support stateless FP8 checkpoints: TE 2.18 returns empty extra state for MXFP8, which older GroupedLinear splitting code cannot save. Apply the [checkpoint patch](../../../docker/patch/megatron/stateless-grouped-fp8-checkpoint.patch) on nodes missing this fix and run the GPU save/load regression in `tests/backends/megatron/test_qwen38_fp8_precision.py`.
+
+Launch from the repository root on a head or worker node of the target Ray cluster, with local Ray discovery pointing to that cluster. `ray-job.sh` calls `ray list nodes`; setting a remote dashboard address alone does not support submission from an arbitrary machine. Set paths and the verified cross-node network interface:
+
+```bash
+export MODEL_DIR=/models/Qwen3.8-Flash-Next
+export DATA_DIR=/datasets/train.jsonl
+export SAVE_DIR=/checkpoints/qwen38-sft
+export RAY_JOBS_ADDRESS='http://<ray-head>:8265'
+export RELAX_HYBRID_EP_COMMIT='<installed-hybridep-commit>'
+export GLOO_SOCKET_IFNAME='<verified-cross-node-interface>'
+
+bash scripts/training/sft/run-qwen38-flash-next-fp8-32xgpu.sh
+```
+
+`NCCL_SOCKET_IFNAME` defaults to the supplied Gloo interface and can be set separately. The launcher uses `ray-job.sh`, skips cluster-wide cleanup, and waits for its job by default. Use an idle cluster with no conflicting Relax Serve applications. Set `RAY_NO_WAIT=1` only when monitoring the submitted job separately. `DRY_RUN=1` prints the effective arguments and runtime environment without submitting a job.
+
+The JSONL fields are `messages`, `tools`, and optional `images`; the producer applies the checkpoint's chat template while preserving thinking content. Image paths must be readable by both the producer and training ranks. Invalid image samples raise an error. Samples exceeding the configured context are skipped, so inspect accepted-sample counts when choosing a context limit.
+
+Recipe defaults are `SEQ_LEN=32768`, `GLOBAL_BATCH_SIZE=8`, `IMAGE_MAX_TOKENS=128`, `NUM_STEPS=50`, and `SAVE_INTERVAL=50`. Start with a small valid dataset and measure the first stage's training peak memory before increasing context or batch size. FP8 GEMMs do not remove the PLE table's BF16 parameters, FP32 gradients, or Adam state. A full native checkpoint with FP32 master weights and Adam moments is approximately 2.6 TB for this model; reserve space for the two retained checkpoints and a new write. Loading full optimizer state can use more temporary GPU memory than training, so include checkpoint recovery in capacity validation.
+
+Load and save use the stable path `SAVE_DIR/EXP_NAME`. The default experiment name includes the precision, so `PRECISION=bf16` starts a separate reference experiment. Explicit experiment names must also remain distinct across independent comparisons. Resume with the same experiment, data snapshot, batch/context settings, template, and planned `NUM_STEPS`; the native checkpoint restores optimizer/scheduler/RNG state, while the SFT data boundary restores the input cursor. Each invocation creates a new ClearML task name.
+
+Do not combine this precision policy with `--fp8-param-gather`, TE operation fusion, or a separate TE precision configuration file. These select different parameter or execution paths and are rejected by the model integration.
 
 ## YAML mixtures and per-dataset loss
 
