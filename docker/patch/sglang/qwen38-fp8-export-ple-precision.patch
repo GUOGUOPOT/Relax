@@ -1,0 +1,19 @@
+--- a/python/sglang/srt/models/qwen4_exp.py
++++ b/python/sglang/srt/models/qwen4_exp.py
+@@ -48,6 +48,7 @@
+     ModelOptMixedPrecisionConfig,
+ )
+ from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
++from sglang.srt.layers.quantization.utils import is_layer_skipped
+ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+ from sglang.srt.model_executor.forward_batch_info import (
+@@ -95,7 +96,7 @@
+     if quant_config is None:
+         return False
+     if quant_config.get_name() == "fp8":
+-        return True
++        return not is_layer_skipped(prefix, quant_config.ignored_layers)
+     if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+         return quant_config.resolve_quant_algo(prefix) == "FP8"
+     return False

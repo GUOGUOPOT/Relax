@@ -66,6 +66,7 @@ class StreamingFP8Writer:
         block_size: list[int] | None,
         device: str | torch.device,
         max_shard_size: int = 4 * 1024**3,
+        source_config: dict | None = None,
     ) -> None:
         if not key_to_filename_map:
             raise ValueError("Online FP8 conversion requires a safetensors source checkpoint")
@@ -73,6 +74,25 @@ class StreamingFP8Writer:
             raise ValueError("max_shard_size must be positive")
         validate_fp8_options(strategy, block_size)
         self.expected_names = set(key_to_filename_map)
+        config = source_config or {}
+        self.expert_only = config.get("model_type") in ("qwen4_exp", "qwen4_exp_text")
+        quantization = (
+            config.get("quantization_config") or config.get("text_config", {}).get("quantization_config") or {}
+        )
+        self.source_scale_names: set[str] = set()
+        if quantization.get("quant_method") == "fp8":
+            # Bridge yields dequantized model values. Source scales belong to
+            # the old quantization and must neither be required nor reused.
+            sharded_tables = {name.rsplit(".shard_", 1)[0] for name in self.expected_names if ".shard_" in name}
+            for name in self.expected_names:
+                for suffix in ("_scale_inv", "_scale"):
+                    if name.endswith(".weight" + suffix):
+                        weight_name = name[: -len(suffix)]
+                        if weight_name in self.expected_names or (
+                            suffix == "_scale" and weight_name.removesuffix(".weight") in sharded_tables
+                        ):
+                            self.source_scale_names.add(name)
+            self.expected_names -= self.source_scale_names
         self.strategy = strategy
         self.block_size = block_size
         self.device = device
@@ -86,10 +106,18 @@ class StreamingFP8Writer:
         strict: bool = True,
         distributed_save: bool = False,
         save_every_n_ranks: int = 1,
+        ignored_source_key_prefixes: Iterable[str] | None = None,
+        ignored_source_key_suffixes: Iterable[str] | None = None,
     ) -> None:
         del save_every_n_ranks
         if distributed_save:
             raise ValueError("Online FP8 conversion does not support Bridge distributed_save")
+
+        prefixes = tuple(ignored_source_key_prefixes or ())
+        suffixes = tuple(ignored_source_key_suffixes or ())
+        expected_names = {
+            name for name in self.expected_names if not name.startswith(prefixes) and not name.endswith(suffixes)
+        }
 
         is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
         rank = torch.distributed.get_rank() if is_distributed else 0
@@ -123,11 +151,15 @@ class StreamingFP8Writer:
 
         try:
             for name, tensor in generator:
+                if name in self.source_scale_names:
+                    raise ValueError(f"Bridge yielded a source scale instead of dequantized model values: {name}")
+                if str(tensor.dtype).startswith("torch.float8_"):
+                    raise ValueError(f"FP8 export requires dequantized model values: {name}")
                 if name in yielded_names:
                     raise ValueError(f"Bridge yielded duplicate tensor: {name}")
                 yielded_names.add(name)
 
-                if name not in self.expected_names:
+                if name not in expected_names:
                     if strict:
                         raise KeyError(f"Bridge tensor '{name}' is missing from the source safetensors index")
                     logger.warning(f"Skipping Bridge tensor missing from the source safetensors index: {name}")
@@ -140,6 +172,7 @@ class StreamingFP8Writer:
                     self.strategy,
                     self.block_size,
                     self.device,
+                    expert_only=self.expert_only,
                 )
                 duplicate_outputs = output_names & converted.keys()
                 if duplicate_outputs:
@@ -148,14 +181,16 @@ class StreamingFP8Writer:
                 converted_size = sum(tensor.numel() * tensor.element_size() for tensor in converted.values())
                 if buffered_tensors and buffered_size + converted_size > self.max_shard_size:
                     flush()
-                buffered_tensors.update(converted)
+                # Bridge mappings may yield strided views for preserved BF16
+                # weights; safetensors requires a contiguous storage layout.
+                buffered_tensors.update((key, value.contiguous()) for key, value in converted.items())
                 buffered_size += converted_size
                 output_names.update(converted)
                 if buffered_size >= self.max_shard_size:
                     flush()
                 del tensor, converted
 
-            missing_names = self.expected_names - yielded_names
+            missing_names = expected_names - yielded_names
             if missing_names:
                 logger.warning(f"Bridge did not yield {len(missing_names)} tensors from the source safetensors index")
                 if strict:
