@@ -77,21 +77,59 @@ Place this object in `metadata.agentspark.replay_spec`. Empty maps above illustr
 
 Start from [agentspark-config.template.json](agentspark-config.template.json). **It is a non-runnable template:** replace every angle-bracket placeholder and every `/ABSOLUTE/MOUNTED/...` path. Replace the quoted integer placeholders with JSON integers, not numeric strings. There are no saved endpoints or credentials. Its field names match the strict `AdapterConfig` schema; additional fields are rejected.
 
-| Field | Required deployment information |
-| --- | --- |
-| `base_url` | AgentSpark **service** HTTP(S) base URL, including any gateway prefix. This is where the adapter sends session lookup, Replay and Send. Do not append `/diandian/session` or `/diandian/chat/sse-send-protocol`; the adapter adds them. |
-| `agent`, `source` | The deployed AgentSpark agent name. The implemented protocol currently supports only `source: "eden"`; confirm that the service supports its session/Replay/Send wire contract. |
-| `model` | The served model alias carried in AgentSpark's model-callback configuration. It is not a local checkpoint path and does not select Relax's backend weights; those belong to the separate Relax/SGLang configuration. |
-| `max_tokens` | An explicit positive integer per-turn generation limit, compatible with the model's context budget. This does not set the full agent-loop limit. |
+| Field                                      | Required deployment information                                                                                                                                                                                                                                                                           |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `base_url`                                 | AgentSpark **service** HTTP(S) base URL, including any gateway prefix. This is where the adapter sends session lookup, Replay and Send. Do not append `/diandian/session` or `/diandian/chat/sse-send-protocol`; the adapter adds them.                                                                   |
+| `agent`, `source`                          | The deployed AgentSpark agent name. The implemented protocol currently supports only `source: "eden"`; confirm that the service supports its session/Replay/Send wire contract.                                                                                                                           |
+| `model`                                    | The served model alias carried in AgentSpark's model-callback configuration. It is not a local checkpoint path and does not select Relax's backend weights; those belong to the separate Relax/SGLang configuration.                                                                                      |
+| `max_tokens`                               | An explicit positive integer per-turn generation limit, compatible with the model's context budget. This does not set the full agent-loop limit.                                                                                                                                                          |
 | `callback_bind_host`, `callback_bind_port` | The address and integer port on which this adapter process listens. Each simultaneously resident invocation needs a usable listener; a fixed shared port cannot be assumed to work for multiple processes. Port `0` is supported for local fixture discovery, not evidence of remotely reachable routing. |
-| `callback_public_base_url` | The HTTP(S) callback base that **AgentSpark can reach**, including any routed prefix, without `/v1/chat/completions`. The adapter appends that path and serves temporary image routes below the same base. This can differ from the local bind address when a verified proxy forwards to it. |
-| `media_allowed_roots` | Explicit absolute directories mounted on every node that can own an adapter invocation. Use the actual deployment paths for the three authorized image roots; the template contains placeholders only. Runtime checks resolve symlinks and revalidate bytes against each row's private manifest. |
+| `callback_public_base_url`                 | The HTTP(S) callback base that **AgentSpark can reach**, including any routed prefix, without `/v1/chat/completions`. The adapter appends that path and serves temporary image routes below the same base. This can differ from the local bind address when a verified proxy forwards to it.              |
+| `media_allowed_roots`                      | Explicit absolute directories mounted on every node that can own an adapter invocation. Use the actual deployment paths for the three authorized image roots; the template contains placeholders only. Runtime checks resolve symlinks and revalidate bytes against each row's private manifest.          |
 
 The network path is adapter → AgentSpark service, AgentSpark → callback/image routes, and callback → the native `RELAX_BASE_URL`. Verify DNS, routes, scheme/port restrictions, proxy prefixes, request/body limits and idle timeouts on these paths. A loopback fixture does not establish remote reachability. The listener itself is plain HTTP; advertising HTTPS requires an explicitly configured TLS-terminating proxy. URLs cannot embed credentials, query strings or fragments, and redirects are not followed.
 
+For a deployment that must retain its verified endpoint across candidate-config refreshes, create a separate
+`<config-filename>.endpoint-pin.json` beside the file passed to `--config`, containing
+`{"schema_version": 1, "base_url": "https://verified-agent.example/service-prefix"}`. Both audit/production commands and
+the offline training-input checker honor this pin. It overrides only `base_url`; model, sampling, callback and media
+settings still come from the candidate. A mismatch logs the pinned endpoint's SHA256, without logging either URL.
+Publish the pin atomically and preserve it when regenerating the candidate. An invalid pin fails validation; an absent
+pin retains the previous unpinned behavior. Removing the pin explicitly returns endpoint ownership to the candidate.
+
+Replay recovery is deliberately narrow. A `restore_only` stream may be repeated only when its error payload has
+one of these three observed exact `message` values, followed by clean EOF with no ACK or other event:
+
+- `Eden SSE rate limiter unavailable: total`
+- `Eden SSE rate limit exceeded: total`
+- `Eden SSE rate limit exceeded: source`
+
+Configuration fields `replay_max_attempts` (default 8 total attempts, including the first),
+`replay_initial_backoff_s` (2), `replay_max_backoff_s` (30), and `replay_attempt_timeout_s` (30) control the
+finite attempt bound, exponential jittered backoff and individual request deadline. The bound applies to both old
+and upgraded runners. Attempts retain the same invocation, prepared input and restore request identity. An unknown
+Replay timeout is an ambiguous POST outcome: it fails without resending. Malformed ACKs, ambiguous transport failures
+and formal Send requests are also never automatically replayed. Audits retain safe reason codes, replay attempt counts
+and an endpoint fingerprint; arbitrary upstream error messages are omitted.
+
+An upgraded native runner advertises `RELAX_AGENT_DEPENDENCY_EXIT_SUPPORTED=1`. Production exits 75 on exhausted
+Replay admission retries, a Replay deadline, a session-lookup or first-callback deadline, or an explicitly identified
+Send admission rejection; the runner propagates an infrastructure failure so Prepare stops taking replacement groups.
+With an already-running older runner, production exits 2 instead, allowing its normal whole-Group failure and
+replacement path. There is no indefinite compatibility hold. Updating adapter files affects newly launched adapter
+processes; it does not upgrade a resident native runner or unblock an adapter already waiting in the old code.
+
+Preparation has separate deadlines: `session_lookup_timeout_s` (default 30) bounds `GET /diandian/session`, and
+`first_callback_timeout_s` (default 120) bounds formal Send until the first model callback passes validation, including
+any configured media/history restoration. That callback disables the first-callback deadline before forwarding to
+Relax, so normal waiting at the first-IR Group barrier, model generation and later tool turns is not timed by this
+watchdog. If the deadline expires first, the local operation is cancelled without resending Send; this does not prove
+remote execution stopped. `prepare_start_spread_s` (default 0) adds one uniform random delay in `[0, value]` before
+session lookup or Replay, spreading admission starts. The 2026-11-11 recovery deployment sets it to 30 seconds.
+
 The template sets `max_callback_bytes` to **67,108,864 (64 MiB)** as an explicit acceptance starting point. The validated dataset has initial image payloads exceeding both 16 MiB and 32 MiB before text/tool/history overhead. This setting is not a proven upper bound for complete or later callbacks: measure actual forwarded bodies and configure every proxy consistently. Images are never silently resized or removed to meet it. See [MODEL_VALIDATION.md](MODEL_VALIDATION.md) for current measured evidence.
 
-`connect_timeout_s` covers connection/pool acquisition. `read_timeout_s: null` deliberately leaves response reads and writes unbounded in the current HTTP clients, so a first model request can remain open at a Group barrier. Verify AgentSpark's own model-client deadline and all intermediary idle deadlines separately. `cleanup_timeout_s` bounds local callback draining and an injected cleanup hook; it is not the remote task deadline, a first-request-barrier timeout, or proof that remote execution was cancelled.
+`connect_timeout_s` covers connection/pool acquisition. `read_timeout_s: null` leaves HTTP-client response reads and writes unbounded; the separate preparation deadlines above bound session lookup and the wait for a validated first callback. After validation, a model request can remain open at a Group barrier. Verify AgentSpark's own model-client deadline and all intermediary idle deadlines separately. `cleanup_timeout_s` bounds local callback draining and an injected cleanup hook; it is not the remote task deadline, a first-request-barrier timeout, or proof that remote execution was cancelled.
 
 Authentication has two distinct boundaries. The model callback requires `Authorization: Bearer <RELAX_SESSION_ID>`; the adapter obtains this credential from the native invocation environment and puts it in AgentSpark's `llm_config`, never in this JSON file or the audit. Temporary image GETs use random per-invocation capability paths because the image consumer may not send that bearer header. By contrast, the stock standalone client currently adds **no AgentSpark-service Authorization header**, and `AdapterConfig` has no service API-key, cookie or client-certificate fields. A deployment requiring such authentication needs its exact authentication contract and an explicit adapter change; do not invent config fields or place credentials in URLs. The library accepts caller-owned HTTP clients, but the CLI does not configure arbitrary authentication from this template.
 

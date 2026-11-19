@@ -34,6 +34,7 @@ from relax.agentic.pipeline.runtime import (
     _build_session_specs,
 )
 from relax.agentic.pipeline.transfer import TransferBatch, TransferDomain
+from relax.agentic.runner import AgentDependencyError, AgentExecutionError
 from relax.agentic.session.admission import (
     AdmissionAction,
     AdmissionReason,
@@ -443,6 +444,71 @@ async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_ga
     assert warning.call_count == 2
     assert not prepare._warming_prepare_tasks
     assert not prepare._ready_prepare_tasks
+
+
+@pytest.mark.parametrize("dependency_first", [False, True])
+async def test_prepare_dependency_failure_takes_priority_over_same_batch_drop(dependency_first) -> None:
+    failure = RuntimeGroupError("agent dependency unavailable")
+    outcomes = (failure, None) if dependency_first else (None, failure)
+    handle = SimpleNamespace(
+        start_group=SimpleNamespace(remote=AsyncMock()),
+        drop_group=SimpleNamespace(remote=AsyncMock()),
+        take_session_results=SimpleNamespace(remote=AsyncMock(return_value=outcomes)),
+    )
+    shard = SimpleNamespace(actor_name="shard", handle=handle, group_streams={})
+    runtime = RuntimeDomain(Namespace(rollout_global_dataset=False), "train", [shard], concurrency=1)
+    source = SimpleNamespace(get_samples=SimpleNamespace(remote=AsyncMock()))
+    prepare = PrepareDomain("train", source, runtime)
+
+    async def finish_before_first_ir(_mode, group_id, _requests):
+        stream = shard.group_streams[group_id]
+        await runtime_mod._take_session_results(stream, stream.session_results)
+
+    handle.start_group.remote.side_effect = finish_before_first_ir
+    group = GroupInput("original-group", [Sample(group_index=0, index=0), Sample(group_index=0, index=1)])
+
+    async def build_specs_inline(_executor, build_specs):
+        return build_specs()
+
+    # The test covers result/error ownership; no worker thread is needed for
+    # the tiny synthetic SessionSpec payloads.
+    with (
+        patch.object(runtime, "_start_shard_observers"),
+        patch.object(asyncio.get_running_loop(), "run_in_executor", side_effect=build_specs_inline),
+    ):
+        prepare._start_prepare(group)
+        await asyncio.gather(*tuple(prepare._warming_prepare_tasks), return_exceptions=True)
+        await asyncio.sleep(0)
+        with pytest.raises(RuntimeGroupError, match="agent dependency unavailable"):
+            prepare.collect()
+
+    source.get_samples.remote.assert_not_awaited()
+    handle.start_group.remote.assert_awaited_once()
+    handle.drop_group.remote.assert_awaited_once_with("original-group")
+    assert runtime.resident_group_count == 0
+    assert runtime._resident_group_permits._value == 1
+    assert not prepare._warming_prepare_tasks
+    assert not prepare._ready_prepare_tasks
+
+
+@pytest.mark.parametrize("dependency_failure", [False, True])
+async def test_agent_dependency_failure_is_infrastructure_error_not_controlled_drop(dependency_failure) -> None:
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = object.__new__(shard_cls)
+    shard._finish_session = AsyncMock()
+    error_type = AgentDependencyError if dependency_failure else AgentExecutionError
+    process_wait = asyncio.get_running_loop().create_future()
+    process_wait.set_result(error_type("fixture failure"))
+    session = SimpleNamespace(session_id="session", group=SimpleNamespace(group_id="group", rollout_mode="train"))
+    await shard._watch_agent_process(session, process_wait)
+    shard._finish_session.assert_awaited_once()
+    finished_session, outcome = shard._finish_session.await_args.args
+    assert finished_session is session
+    if dependency_failure:
+        assert isinstance(outcome, RuntimeGroupError)
+        assert "AgentDependencyError" in str(outcome)
+    else:
+        assert outcome is None
 
 
 def test_chat_request_validation_and_logprob_payload() -> None:

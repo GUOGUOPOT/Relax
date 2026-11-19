@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Explicit, prepared AgentSpark envelopes; no dataset or history reconstruction."""
+"""Explicit, prepared AgentSpark envelopes; no dataset or history
+reconstruction."""
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
@@ -25,7 +27,8 @@ REPLAY_ATTRIBUTE_KEYS = {
 
 
 class AdapterError(RuntimeError):
-    """A fixed, non-sensitive failure code safe to include in audit metadata."""
+    """A fixed, non-sensitive failure code safe to include in audit
+    metadata."""
 
     def __init__(self, code: str) -> None:
         self.code = code
@@ -94,6 +97,46 @@ class AdapterConfig:
     cleanup_timeout_s: float = 2.0
     max_callback_bytes: int = 16 * 1024 * 1024
     media_allowed_roots: tuple[str, ...] = ()
+    replay_max_attempts: int = 8
+    replay_initial_backoff_s: float = 2.0
+    replay_max_backoff_s: float = 30.0
+    replay_attempt_timeout_s: float = 30.0
+    prepare_start_spread_s: float = 0.0
+    session_lookup_timeout_s: float = 30.0
+    first_callback_timeout_s: float = 120.0
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> "AdapterConfig":
+        """Honor an independently pinned deployment endpoint across config
+        refreshes."""
+        from .media import strict_json_loads
+
+        path = Path(path)
+        payload = strict_json_loads(path.read_bytes())
+        pin_path = path.with_name(path.name + ".endpoint-pin.json")
+        try:
+            pin_bytes = pin_path.read_bytes()
+        except FileNotFoundError:
+            return cls.from_payload(payload)
+        pin = strict_json_loads(pin_bytes)
+        if (
+            not isinstance(pin, dict)
+            or set(pin) != {"schema_version", "base_url"}
+            or type(pin["schema_version"]) is not int
+            or pin["schema_version"] != 1
+        ):
+            raise AdapterError("endpoint_pin_invalid")
+        endpoint = http_url(pin["base_url"], "endpoint_pin_invalid")
+        if not isinstance(payload, dict):
+            raise AdapterError("config_not_object")
+        if payload.get("base_url") != endpoint:
+            from relax.utils.logging_utils import get_logger
+
+            get_logger(__name__).warning(
+                "AgentSpark endpoint drift ignored; using pinned endpoint_sha256=%s",
+                hashlib.sha256(endpoint.encode()).hexdigest(),
+            )
+        return cls.from_payload({**payload, "base_url": endpoint})
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "AdapterConfig":
@@ -115,6 +158,13 @@ class AdapterConfig:
             "cleanup_timeout_s",
             "max_callback_bytes",
             "media_allowed_roots",
+            "replay_max_attempts",
+            "replay_initial_backoff_s",
+            "replay_max_backoff_s",
+            "replay_attempt_timeout_s",
+            "prepare_start_spread_s",
+            "session_lookup_timeout_s",
+            "first_callback_timeout_s",
         }
         if not required <= payload.keys() or set(payload) - required - optional:
             raise AdapterError("config_fields_invalid")
@@ -125,15 +175,29 @@ class AdapterConfig:
             required_text(config[key], f"config_{key}_invalid")
         if config["source"] != "eden":
             raise AdapterError("only_eden_protocol_supported")
-        for key in ("max_tokens", "max_callback_bytes"):
-            value = config.get(key, cls.max_callback_bytes)
+        for key in ("max_tokens", "max_callback_bytes", "replay_max_attempts"):
+            value = config.get(key, getattr(cls, key, None))
             if type(value) is not int or value <= 0:
                 raise AdapterError(f"config_{key}_invalid")
         port = config["callback_bind_port"]
         if type(port) is not int or not 0 <= port <= 65535:
             raise AdapterError("callback_port_invalid")
-        for key in ("connect_timeout_s", "cleanup_timeout_s"):
+        for key in (
+            "connect_timeout_s",
+            "cleanup_timeout_s",
+            "replay_initial_backoff_s",
+            "replay_max_backoff_s",
+            "replay_attempt_timeout_s",
+            "session_lookup_timeout_s",
+            "first_callback_timeout_s",
+        ):
             config[key] = positive_seconds(config.get(key, getattr(cls, key)), f"config_{key}_invalid")
+        spread = config.get("prepare_start_spread_s", cls.prepare_start_spread_s)
+        if isinstance(spread, bool) or not isinstance(spread, (int, float)) or not math.isfinite(spread) or spread < 0:
+            raise AdapterError("config_prepare_start_spread_s_invalid")
+        config["prepare_start_spread_s"] = float(spread)
+        if config["replay_max_backoff_s"] < config["replay_initial_backoff_s"]:
+            raise AdapterError("config_replay_backoff_invalid")
         config["read_timeout_s"] = positive_seconds(
             config.get("read_timeout_s"),
             "config_read_timeout_s_invalid",
@@ -193,8 +257,9 @@ class RelaxContext:
 def prepare_envelope(session_input: Any) -> dict[str, Any]:
     """Require an explicit prepared envelope instead of guessing from messages.
 
-    Native prepared inputs, replay messages/resource mappings and prompt overrides
-    must come from the source dataset converter. This layer only validates them.
+    Native prepared inputs, replay messages/resource mappings and prompt
+    overrides must come from the source dataset converter. This layer only
+    validates them.
     """
     if not isinstance(session_input, dict) or not isinstance(session_input.get("metadata"), dict):
         raise AdapterError("metadata_agentspark_required")

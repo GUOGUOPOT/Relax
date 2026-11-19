@@ -87,6 +87,8 @@ class PreparationConfig:
     history_max_chars: int
     resource_max_chars: int
     identity: dict[str, Any]
+    capabilities: dict[str, str] | None = None
+    skills_name_list: list[str] | None = None
 
     @classmethod
     def from_source_config(
@@ -122,9 +124,16 @@ class PreparationConfig:
         runtime = env.get("DOTSBRIDGE_AGENTSPARK_RUNTIME_CONTEXT_FROM_HISTORY")
         if runtime not in ("0", "1"):
             raise PreparationError("source_runtime_policy_missing")
-        # This converter deliberately covers the chosen no-Loader task only.
-        if env.get("SLIME_AGENTSPARK_SKILL_LOADER_ENABLE") != "0":
-            raise PreparationError("source_skill_loader_not_supported")
+        loader_flag = env.get("SLIME_AGENTSPARK_SKILL_LOADER_ENABLE")
+        if loader_flag not in ("0", "1"):
+            raise PreparationError("source_skill_loader_policy_missing")
+        capabilities = strict_json(env.get("DOTSBRIDGE_AGENTSPARK_CAPABILITIES_JSON", "null"))
+        skills = strict_json(env.get("DOTSBRIDGE_AGENTSPARK_SKILLS_NAME_LIST_JSON", "null"))
+        loader = loader_flag == "1"
+        if loader != (isinstance(capabilities, dict) and capabilities.get("skill_loader") == "1"):
+            raise PreparationError("source_skill_loader_capabilities_mismatch")
+        if loader and (not skills or "load_skills" not in tools):
+            raise PreparationError("source_skill_loader_catalog_missing")
         if (
             agent.get("image_transport") != "agentspark_remote_url"
             or agent.get("image_selection_policy") != "pinned_compat"
@@ -152,17 +161,22 @@ class PreparationConfig:
             "tool_versions": versions,
             "prompt_spec": {"system_prompt": system, "user_prompt": user},
         }
+        for key, value in (("capabilities", capabilities), ("skills_name_list", skills)):
+            if value is not None:
+                probe[key] = value
         prepare_envelope({"metadata": {"agentspark": probe}})
         identity = {
             "source_config_sha256": _digest(raw),
             "profile_files": {name: _digest(blob) for name, blob in blobs.items()},
             "profile_name": env.get("SLIME_AGENTSPARK_PROMPT_PROFILE"),
             "runtime_context_from_history": runtime == "1",
-            "skill_loader_enabled": False,
+            "skill_loader_enabled": loader,
             "limits": limits,
             "image_selection_policy": "pinned_compat",
             "image_allowed_hosts": hosts,
         }
+        if capabilities is not None or skills is not None:
+            identity.update(capabilities=capabilities, skills_name_list=skills)
         identity["profile_sha256"] = _digest(_encoded(identity))
         return cls(
             miles_source=Path(miles_source).resolve(strict=True),
@@ -170,6 +184,8 @@ class PreparationConfig:
             user_prompt=user,
             tools=tools,
             tool_versions=versions,
+            capabilities=copy.deepcopy(capabilities),
+            skills_name_list=copy.deepcopy(skills),
             image_allowed_hosts=hosts,
             runtime_from_history=runtime == "1",
             identity=identity,
@@ -473,6 +489,10 @@ class MilesPreparedConverter:
             "bound_user_id": user_id,
             "prompt_spec": {"system_prompt": self.config.system_prompt, **environment.prompt_spec},
         }
+        for key in ("capabilities", "skills_name_list"):
+            value = getattr(self.config, key)
+            if value is not None:
+                envelope[key] = copy.deepcopy(value)
         if compiled["replay_messages"]:
             envelope["replay_spec"] = {
                 "messages": compiled["replay_messages"],

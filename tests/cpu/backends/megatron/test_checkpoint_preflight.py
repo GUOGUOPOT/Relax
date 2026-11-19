@@ -257,3 +257,115 @@ def test_checkpoint_two_rank_probe_errors_never_enter_loader(tmp_path):
             if worker.is_alive():
                 worker.terminate()
             worker.join(timeout=5)
+
+
+@pytest.mark.parametrize("kind", ["missing", "hf", "model_only"])
+def test_strict_resume_never_falls_back_or_resets_optimizer(monkeypatch, tmp_path, kind):
+    args = Namespace(load=str(tmp_path), strict_checkpoint_resume=True, ckpt_format="torch_dist")
+    if kind == "hf":
+        (tmp_path / "config.json").write_text("{}")
+    elif kind == "model_only":
+        (tmp_path / "latest_checkpointed_iteration.txt").write_text("7")
+        save({"model": {"weight": torch.ones(2)}}, checkpoint_id=tmp_path / "iter_0000007")
+    calls = _stub_loaders(monkeypatch, args)
+    with pytest.raises(RuntimeError, match="Strict resume requires"):
+        checkpoint.load_checkpoint([Namespace(role="actor")], object(), None, {}, False)
+    assert not calls
+    assert not getattr(args, "no_load_optim", False)
+
+
+@pytest.fixture
+def strict_checkpoint(tmp_path, monkeypatch):
+    from megatron.core import dist_checkpointing
+
+    from relax.utils.checkpoint_resume import atomic_save_dataset_state, dataset_identity
+
+    directory = tmp_path / "iter_0000007"
+    save(
+        {
+            "model": {"weight": torch.ones(2)},
+            "optimizer": {"exp_avg": torch.ones(2)},
+            "rng_state": {"python": [1, 2, 3]},
+        },
+        checkpoint_id=directory,
+    )
+    prompt = tmp_path / "prompts.jsonl"
+    prompt.write_text('{"text":"synthetic"}\n')
+    args = Namespace(
+        ckpt_format="torch_dist",
+        prompt_data=str(prompt),
+        n_samples_per_prompt=2,
+        rollout_seed=42,
+        rollout_shuffle=True,
+        colocate=True,
+        rollout_global_dataset=True,
+        **{
+            key: 1
+            for key in (
+                "tensor_model_parallel_size",
+                "pipeline_model_parallel_size",
+                "context_parallel_size",
+                "expert_model_parallel_size",
+                "data_parallel_size",
+                "world_size",
+            )
+        },
+    )
+    common = {"args": Namespace(**vars(args)), "iteration": 7, "opt_param_scheduler": {"num_steps": 16}}
+    monkeypatch.setattr(dist_checkpointing, "load_common_state_dict", lambda _: common)
+    state = {
+        "sample_offset": 1,
+        "epoch_id": 0,
+        "sample_group_index": 1,
+        "sample_index": 2,
+        "metadata": {},
+        "use_streaming": False,
+        "resume_contract": {"version": 1, "rollout_id": 7, "dataset_size": 1, **dataset_identity(args)},
+    }
+    cursor = tmp_path / "dataset/global_dataset_state_dict_7.pt"
+    atomic_save_dataset_state(state, str(cursor))
+    return args, directory, common, cursor
+
+
+def test_strict_resume_validates_real_dcp_and_dataset_metadata(strict_checkpoint):
+    args, directory, _, _ = strict_checkpoint
+    result = checkpoint_metadata._validate_strict_resume_metadata(args, directory)
+    assert result["iteration"] == 7 and result["scheduler_num_steps"] == 16
+    assert result["shard_count"] > 0 and len(result["dataset_sha256"]) == 64
+
+
+@pytest.mark.parametrize("failure", ["iteration", "scheduler", "rng", "layout", "flags", "cursor", "dataset", "shard"])
+def test_strict_resume_rejects_incomplete_state(strict_checkpoint, failure):
+    from torch.distributed.checkpoint import FileSystemReader
+
+    args, directory, common, cursor = strict_checkpoint
+    if failure == "iteration":
+        common["iteration"] = 8
+    elif failure == "scheduler":
+        common.pop("opt_param_scheduler")
+    elif failure == "rng":
+        common["args"].no_save_rng = True
+    elif failure == "layout":
+        common["args"].tensor_model_parallel_size = 2
+    elif failure == "flags":
+        args.no_load_optim = True
+    elif failure == "cursor":
+        cursor.unlink()
+    elif failure == "dataset":
+        Path(args.prompt_data).write_text("different dataset")
+    else:
+        info = next(iter(FileSystemReader(str(directory)).read_metadata().storage_data.values()))
+        (directory / info.relative_path).write_bytes(b"truncated")
+    with pytest.raises((RuntimeError, OSError), match="Strict resume|No such file"):
+        checkpoint_metadata._validate_strict_resume_metadata(args, directory)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("agentic_prelaunch", True), ("fully_async", True), ("rollout_global_dataset", False), ("partial_rollout", True)],
+)
+def test_strict_resume_rejects_unpersisted_pending_work(strict_checkpoint, field, value):
+    args, directory, _, _ = strict_checkpoint
+    setattr(args, field, value)
+    with pytest.raises(RuntimeError, match="without prelaunch"):
+        checkpoint_metadata._validate_strict_resume_metadata(args, directory)

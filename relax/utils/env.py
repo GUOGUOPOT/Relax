@@ -386,6 +386,7 @@ class Envs(metaclass=_EnvsMeta):
     MASTER_ADDR = EnvProperty("MASTER_ADDR", str, "127.0.0.1")
     RAY_JOB_ID = EnvProperty("RAY_JOB_ID", str, None)
     RELAX_LAUNCHER_NAMESPACE = EnvProperty("RELAX_LAUNCHER_NAMESPACE", str, None)
+    RELAX_AGENTIC_RUNTIME_DIR = EnvProperty("RELAX_AGENTIC_RUNTIME_DIR", str, None)
     RELAX_AGENTIC_LAUNCHER_CONCURRENCY = EnvProperty("RELAX_AGENTIC_LAUNCHER_CONCURRENCY", str, None)
     SLIME_HOST_IP = EnvProperty("SLIME_HOST_IP", str, None)
     SLIME_PREFER_IPV6 = EnvProperty("SLIME_PREFER_IPV6", bool, False)

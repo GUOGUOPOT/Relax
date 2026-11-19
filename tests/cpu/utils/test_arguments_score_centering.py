@@ -92,3 +92,30 @@ def test_sc_yaml_cannot_enable_opd_after_validation(arguments_module, tmp_path):
     args.custom_config_path = str(config)
     with pytest.raises(ValueError, match="OPD cannot be enabled together"):
         arguments_module.apply_custom_config_overrides(args)
+
+
+def test_v21_custom_sc_yaml_keeps_grpo_normalization_and_agentic_media(arguments_module, tmp_path):
+    import json
+
+    from examples.agentspark_agentic.v21_score_centering_loss import LOSS_PATH
+
+    args = _sc_args(
+        advantage_estimator="grpo",
+        loss_type="custom_loss",
+        calculate_per_token_loss=False,
+        custom_loss_function_path="examples.agentspark_agentic.v21_loss.loss",
+        use_tis=True,
+        rewards_normalization=False,
+        multimodal_keys={"image": "images"},
+        use_agentic_rollout=True,
+    )
+    arguments_module.validate_algorithm_args(args)
+    config = tmp_path / "sc.json"
+    config.write_text(json.dumps({"custom_loss_function_path": LOSS_PATH, "use_tis": False}))
+    args.custom_config_path = str(config)
+    arguments_module.apply_custom_config_overrides(args)
+    assert args.advantage_estimator == "grpo" and not args.calculate_per_token_loss
+    assert not args.rewards_normalization and args.multimodal_keys == {"image": "images"}
+    args.use_agentic_rollout = False
+    with pytest.raises(ValueError, match="text-only"):
+        arguments_module.validate_algorithm_args(args)

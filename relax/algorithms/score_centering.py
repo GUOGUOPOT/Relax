@@ -20,6 +20,7 @@ def compute_score_centering_loss(
     tis_clip: float = 2.0,
     mis_low: float = 0.5,
     mis_high: float = 5.0,
+    center_scores: bool = True,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Return token losses and detached token diagnostics before reduction.
 
@@ -76,9 +77,10 @@ def compute_score_centering_loss(
         residual = head_mass - alpha[:, None] * p
 
     # Mask before multiplication: zero weights and padding may accompany -inf.
-    correction = (residual * torch.where(residual != 0, train_head, 0.0)).sum(-1)
-    sampled_term = weight * torch.where(weight != 0, train_sample, 0.0)
-    loss = -advantage * torch.where(advantage != 0, sampled_term - correction, 0.0)
+    correction = (residual * torch.where((residual != 0) & torch.isfinite(train_head), train_head, 0.0)).sum(-1)
+    sampled_term = weight * torch.where((weight != 0) & torch.isfinite(train_sample), train_sample, 0.0)
+    term = sampled_term - correction if center_scores else sampled_term
+    loss = -advantage * torch.where(advantage != 0, term, 0.0)
     metrics = {
         "sc_rollout_head_mass": q_mass,
         "sc_train_head_mass": p_mass,

@@ -3,6 +3,7 @@
 """SC gradients against a dense distribution, independent of the head
 reduction."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -216,3 +217,22 @@ def test_score_centering_preset_uses_group_mean_and_broadcast_without_on_policy_
     assert spec.forbids_normalize_advantages and spec.forbids_reward_side_kl
     assert spec.requires_global_token_loss
     assert spec.supports_context_parallel and not spec.requires_on_policy_updates
+
+
+def test_zero_probability_active_scores_have_finite_miles_gradient():
+    sample = torch.tensor([-torch.inf], requires_grad=True)
+    head = torch.tensor([[-torch.inf, math.log(0.2)]], requires_grad=True)
+    loss, _ = compute_score_centering_loss(
+        log_probs=sample,
+        advantages=torch.ones(1),
+        rollout_log_probs=torch.tensor([math.log(0.1)]),
+        train_topk_log_probs=head,
+        rollout_topk_log_probs=torch.tensor([[math.log(0.3), math.log(0.3)]]),
+        loss_mask=torch.ones(1),
+        mode="none",
+    )
+    # p_H=(0,.2), q_H=(.3,.3), rho=.5; only residual .2 * log(.2) is scored.
+    torch.testing.assert_close(loss, torch.tensor([0.2 * math.log(0.2)]))
+    sample_grad, head_grad = torch.autograd.grad(loss.sum(), (sample, head))
+    torch.testing.assert_close(sample_grad, torch.zeros_like(sample))
+    torch.testing.assert_close(head_grad, torch.tensor([[0.0, 0.2]]))

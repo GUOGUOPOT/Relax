@@ -60,6 +60,11 @@ class AgentExecutionError(RuntimeError):
     """Expected agent-level failure that drops its rollout group."""
 
 
+class AgentDependencyError(RuntimeError):
+    """An agent dependency failed; stop replenishment instead of dropping
+    data."""
+
+
 class LauncherProtocolError(RuntimeError):
     """The node-local launcher returned an invalid message."""
 
@@ -439,6 +444,9 @@ class ManagedAgentProcess:
                 "RELAX_SESSION_IO_DIR": session_dir,
                 "RELAX_INPUT_JSON": str(input_path),
                 "RELAX_OUTPUT_JSON": str(output_path),
+                # Native capability: neither inherited env nor app options can
+                # override the runner's dependency-failure exit contract.
+                "RELAX_AGENT_DEPENDENCY_EXIT_SUPPORTED": "1",
             }
             mark_agentic_event(process_events, "managed_prepare_end_at")
             try:
@@ -462,6 +470,10 @@ class ManagedAgentProcess:
                         f"Managed command agent timed out after {self._spec.timeout_s} seconds.\n{log_tail}".rstrip()
                     )
                 if return_code != 0 and not self._terminated:
+                    if return_code == 75 and not (output_path.exists() or output_path.is_symlink()):
+                        raise AgentDependencyError(
+                            "Managed command agent dependency unavailable (exit 75); stopping rollout replenishment."
+                        )
                     raise AgentExecutionError(
                         f"Managed command agent exited with code {return_code}.\n{log_tail}".rstrip()
                     )
@@ -562,6 +574,20 @@ def launcher_socket_path() -> str:
     """Return the node-local launcher socket path."""
 
     user = _launcher_token(Envs.USER or Envs.LOGNAME or str(os.getuid()))
+    runtime_dir = os.environ.get("RELAX_AGENTIC_RUNTIME_DIR")
+    if runtime_dir:
+        # Shared storage requires node and job isolation; hashes bound the
+        # Unix socket name below Linux's 108-byte address limit.
+        root = Path(runtime_dir)
+        if not root.is_absolute():
+            raise ValueError("RELAX_AGENTIC_RUNTIME_DIR must be absolute")
+        node = hashlib.sha256(socket.gethostname().encode()).hexdigest()[:8]
+        job = hashlib.sha256(f"{user}:{_launcher_namespace()}".encode()).hexdigest()[:12]
+        path = root.resolve() / f"{node}-{job}.sock"
+        if len(os.fsencode(path)) >= 108:
+            raise ValueError("RELAX_AGENTIC_RUNTIME_DIR produces an overlong Unix socket path")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return str(path)
     return f"/tmp/relax-agentic-launcher-{user}-{_launcher_namespace()}.sock"
 
 

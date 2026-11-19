@@ -61,6 +61,12 @@ done
 #    NUM_ROLLOUT=$((ACCEPTED_ROWS / ROLLOUT_BATCH_SIZE * EPOCHS))
 #fi
 NUM_ROLLOUT=$((ACCEPTED_ROWS / ROLLOUT_BATCH_SIZE * EPOCHS))
+# Explicit task target; input identity and the complete dataset remain validated.
+if [ -n "${CP8_NUM_ROLLOUT:-}" ]; then
+    [[ "$CP8_NUM_ROLLOUT" =~ ^[1-9][0-9]*$ ]] || { echo "CP8_NUM_ROLLOUT must be positive" >&2; exit 2; }
+    (( CP8_NUM_ROLLOUT <= NUM_ROLLOUT )) || { echo "CP8_NUM_ROLLOUT exceeds configured schedule" >&2; exit 2; }
+    NUM_ROLLOUT="$CP8_NUM_ROLLOUT"
+fi
 GLOBAL_BATCH_SIZE=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))
 MAX_GLOBAL_RESTART="${MAX_GLOBAL_RESTART:-0}"
 [[ "$MAX_GLOBAL_RESTART" =~ ^[0-9]+$ ]] || { echo "MAX_GLOBAL_RESTART must be a non-negative integer" >&2; exit 2; }
@@ -93,12 +99,28 @@ CKPT_ARGS=(
     --ref-load "${HF_CHECKPOINT}"
     --trust-remote-code
     --megatron-to-hf-mode bridge
-    --save "${CHECKPOINT_DIR}"
-    --save-interval "${SAVE_INTERVAL:-100}"
-    --max-actor-ckpt-to-keep "${MAX_ACTOR_CKPT_TO_KEEP:-1}"
 )
+# Short optimizer validation can skip the multi-terabyte final checkpoint.
+if [ "${CP8_DISABLE_CHECKPOINT:-0}" != 1 ]; then
+    CKPT_ARGS+=(
+        --save-dataset-before-checkpoint
+        --save "${CHECKPOINT_DIR}"
+        --save-interval "${SAVE_INTERVAL:-100}"
+        --max-actor-ckpt-to-keep "${MAX_ACTOR_CKPT_TO_KEEP:-1}"
+    )
+fi
 if [ -n "${LOAD_DIR:-}" ]; then
-    CKPT_ARGS+=(--load "${LOAD_DIR}")
+    CKPT_ARGS+=(--load "${LOAD_DIR}" --strict-checkpoint-resume)
+fi
+if [ -n "${CP8_LOAD_STEP:-}" ]; then
+    [[ "$CP8_LOAD_STEP" =~ ^[0-9]+$ && -n "${LOAD_DIR:-}" ]] || {
+        echo "CP8_LOAD_STEP requires a non-negative step and LOAD_DIR" >&2; exit 2;
+    }
+    CKPT_ARGS+=(--ckpt-step "$CP8_LOAD_STEP")
+fi
+# Optional validation hook; the default training path does not install one.
+if [ -n "${CP8_MEGATRON_INIT_HOOK:-}" ]; then
+    CKPT_ARGS+=(--custom-megatron-init-path "$CP8_MEGATRON_INIT_HOOK")
 fi
 # Routed weight updates are enabled by default; set to 0 to use broadcast.
 if [ "${COLOCATE_EXPERT_WEIGHT_ROUTING:-1}" = "1" ]; then
@@ -147,15 +169,15 @@ PERF_ARGS=(
     --pipeline-model-parallel-size 4
     --decoder-first-pipeline-num-layers 21
     --decoder-last-pipeline-num-layers 24
-    --context-parallel-size 8
+    --context-parallel-size 4
     --expert-model-parallel-size 32
     --expert-tensor-parallel-size 1
     --recompute-granularity full
     --recompute-method uniform
     --recompute-num-layers 1
     --use-dynamic-batch-size
-    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-16384}"
-    --log-probs-max-tokens-per-gpu "${LOG_PROBS_MAX_TOKENS_PER_GPU:-16384}"
+    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-65536}"
+    --log-probs-max-tokens-per-gpu "${LOG_PROBS_MAX_TOKENS_PER_GPU:-65536}"
     # CP8 * 16384 covers the 131072 context; each budget is divisible by TP4 * 1024.
     --data-pad-size-multiplier 1024
     # EFA: retain the K3 alltoall path, without DeepEP/NVSHMEM.
@@ -172,7 +194,7 @@ PERF_ARGS=(
     # Colocated KL keeps independent actor/ref CPU snapshots; bounded HDO gradients
     # remove the full FP32 CPU gradient cache without changing either snapshot.
     # Empty allocator settings override inherited expandable segments under TMS.
-    --train-env-vars '{"FLA_TILELANG":"0","OPEN_TRAINING_MXFP4_FAKE_QAT_FLAG":"1","TORCHINDUCTOR_COMPILE_THREADS":"1","PYTORCH_ALLOC_CONF":"","PYTORCH_CUDA_ALLOC_CONF":"","RELAX_KIMI_K3_FUSED_SITU":"1","RELAX_HDO_BOUNDED_CPU_GRADS":"1"}'
+    --train-env-vars '{"FLA_TILELANG":"0","OPEN_TRAINING_MXFP4_FAKE_QAT_FLAG":"1","TORCHINDUCTOR_COMPILE_THREADS":"1","PYTORCH_ALLOC_CONF":"","PYTORCH_CUDA_ALLOC_CONF":"","RELAX_KIMI_K3_FUSED_SITU":"1","RELAX_HDO_BOUNDED_CPU_GRADS":"1","RELAX_LOG_HOST_MEMORY":"1"}'
 )
 GRPO_ARGS=(
     --advantage-estimator grpo
@@ -280,9 +302,22 @@ runtime.setdefault('env_vars', {}).update({
     'AGENTSPARK_V21_CONTRACT': os.environ['AGENTSPARK_V21_CONTRACT'],
 })
 env = runtime['env_vars']
+managed_names = []
+if path := os.environ.get('RELAX_MANAGED_ENV_JSON'):
+    from pathlib import Path
+    managed = json.loads(Path(path).read_text())
+    if not isinstance(managed, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in managed.items()):
+        raise ValueError('Managed environment must map names to strings')
+    env.update(managed)
+    managed_names = list(managed)
+    runtime['worker_process_setup_hook'] = 'k3_run_runtime.setup_worker'
+# SC requires temperature-adjusted behavior probabilities in every worker.
+if 'SGLANG_RETURN_ORIGINAL_LOGPROB' in os.environ:
+    env['SGLANG_RETURN_ORIGINAL_LOGPROB'] = os.environ['SGLANG_RETURN_ORIGINAL_LOGPROB']
+    managed_names.append('SGLANG_RETURN_ORIGINAL_LOGPROB')
 propagate = env.get('RELAX_PROPAGATE_ENV_VARS', '').split(',')
 env['RELAX_PROPAGATE_ENV_VARS'] = ','.join(dict.fromkeys(
-    name for name in [*propagate, 'MEGATRON_SYNC_SAVE_BOUNDED_STAGING', 'MEGATRON_SYNC_SAVE_STAGE_BYTES', 'AGENTSPARK_V21_CONTRACT'] if name
+    name for name in [*propagate, *managed_names, 'MEGATRON_SYNC_SAVE_BOUNDED_STAGING', 'MEGATRON_SYNC_SAVE_STAGE_BYTES', 'AGENTSPARK_V21_CONTRACT'] if name
 ))
 print(json.dumps(runtime))
 PY
@@ -297,5 +332,5 @@ ray job submit "${RAY_SUBMIT_ARGS[@]}" \
     --address="${RAY_DASHBOARD_ADDRESS}" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
-    -- python3 -m relax.entrypoints.train "${TRAIN_ARGS[@]}" \
+    -- python3 -m "${RELAX_MANAGED_DRIVER_MODULE:-relax.entrypoints.train}" "${TRAIN_ARGS[@]}" \
     2>&1 | tee "${RELAX_ROOT}/log/${EXP_NAME}-${now}.log"

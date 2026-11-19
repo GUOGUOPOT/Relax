@@ -177,3 +177,67 @@ def test_checkpoint_chained_optimizer_resumes_adam_and_scheduler(
     finally:
         if owned_group:
             dist.destroy_process_group()
+
+
+def test_strict_resume_accepts_native_mcore_keys_and_rng_objects(tmp_path, monkeypatch):
+    from megatron.core.dist_checkpointing.mapping import ShardedObject
+
+    from relax.utils.checkpoint_resume import atomic_save_dataset_state, dataset_identity
+
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'strict-rendezvous'}", rank=0, world_size=1)
+    try:
+        chain, scheduler, parameters = _cpu_chain()
+        _step(chain, scheduler, 0)
+        prompt = tmp_path / "prompts.jsonl"
+        prompt.write_text('{"text":"synthetic"}\n')
+        args = Namespace(
+            ckpt_format="torch_dist",
+            prompt_data=str(prompt),
+            n_samples_per_prompt=2,
+            rollout_seed=42,
+            rollout_shuffle=True,
+            colocate=True,
+            rollout_global_dataset=True,
+            **{
+                key: 1
+                for key in (
+                    "tensor_model_parallel_size",
+                    "pipeline_model_parallel_size",
+                    "context_parallel_size",
+                    "expert_model_parallel_size",
+                    "data_parallel_size",
+                    "world_size",
+                )
+            },
+        )
+        state = _state(chain, scheduler, parameters, {"distrib_optim_sharding_type": "dp_reshardable"})
+        state.update(
+            args=args,
+            iteration=3,
+            rng_state=ShardedObject("rng_state", [{"torch_rng_state": torch.get_rng_state()}], (1, 1), (0, 0)),
+        )
+        # Match Kimi's native parameter namespace instead of PyTorch's outer dict key.
+        state["model"]["language_model.weight"] = ShardedTensor.from_rank_offsets(
+            "language_model.weight", torch.ones(2)
+        )
+        path = tmp_path / "iter_0000003"
+        path.mkdir()
+        dist_checkpointing.save(state, str(path), sharded_strategy=_CPUSaveStrategy())
+        cursor = {
+            "sample_offset": 1,
+            "epoch_id": 0,
+            "sample_group_index": 1,
+            "sample_index": 2,
+            "metadata": {},
+            "use_streaming": False,
+            "resume_contract": {"version": 1, "rollout_id": 3, "dataset_size": 1, **dataset_identity(args)},
+        }
+        atomic_save_dataset_state(cursor, str(tmp_path / "dataset/global_dataset_state_dict_3.pt"))
+        result = checkpoint_metadata._validate_strict_resume_metadata(args, path)
+        assert result["iteration"] == 3 and result["scheduler_num_steps"] == 1
+        keys = dcp.FileSystemReader(path).read_metadata().state_dict_metadata
+        assert "language_model.weight" in keys
+        assert any(key.startswith("rng_state/shard_") for key in keys)
+        assert not any(key.startswith("model.") for key in keys)
+    finally:
+        dist.destroy_process_group()

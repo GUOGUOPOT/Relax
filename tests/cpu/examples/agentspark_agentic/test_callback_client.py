@@ -249,7 +249,16 @@ def test_complex_contexts_fail_closed(change, code):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replay", [False, True])
-async def test_offline_end_to_end_drains_tail_and_never_claims_training(config, context, session_input, replay):
+@pytest.mark.parametrize("loader", [False, True])
+async def test_offline_end_to_end_drains_tail_and_never_claims_training(
+    config, context, session_input, replay, loader
+):
+    if loader:
+        session_input["metadata"]["agentspark"].update(
+            capabilities={"skill_loader": "1"},
+            skills_name_list=["subscription"],
+            prompt_spec={"system_prompt": "<AvailableSkills>subscription</AvailableSkills>", "user_prompt": "user"},
+        )
     posts = []
     cleanup_calls = []
     snapshot_raw = json.dumps({"data": {"private_business_data": "retained-private"}})
@@ -304,6 +313,11 @@ async def test_offline_end_to_end_drains_tail_and_never_claims_training(config, 
     assert report["audit_status"] == "collected" and report["training_ready"] is False
     assert report["session_source"] == ("replay_ack" if replay else "get_session")
     assert report["send_attempts"] == 1 and len(posts) == 1 + int(replay)
+    assert report["agentspark_request"] == {
+        "tools": posts[-1]["tools"],
+        "capabilities": posts[-1].get("capabilities") or {},
+        "skills_name_list": posts[-1].get("skills_name_list") or [],
+    }
     assert report["stream"]["eof"] and len(report["stream"]["events"]) == 2
     assert (
         report["stream"]["events"][-1]["sha256"]
@@ -559,16 +573,30 @@ async def test_remote_error_keeps_only_known_structured_diagnostics(config, cont
     async def remote(request):
         if request.method == "GET":
             return httpx.Response(200, json={"session_id": "remote"})
-        return httpx.Response(200, content=event("error", data={"error": {
-            "code": "context_length_exceeded", "type": "invalid_request_error", "status_code": 400,
-            "message": context.session_id + " https://private.invalid /private/file data:image/png;base64,SECRET",
-            "request_id": "SECRET", "authorization": "SECRET",
-        }}))
+        return httpx.Response(
+            200,
+            content=event(
+                "error",
+                data={
+                    "error": {
+                        "code": "context_length_exceeded",
+                        "type": "invalid_request_error",
+                        "status_code": 400,
+                        "message": context.session_id
+                        + " https://private.invalid /private/file data:image/png;base64,SECRET",
+                        "request_id": "SECRET",
+                        "authorization": "SECRET",
+                    }
+                },
+            ),
+        )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(remote)) as spark:
         report = await run_audit(config, context, session_input, agentspark_http=spark)
     assert report["stream"]["events"][0]["diagnostic"] == {
-        "code": "context_length_exceeded", "type": "invalid_request_error", "status": 400,
+        "code": "context_length_exceeded",
+        "type": "invalid_request_error",
+        "status": 400,
     }
     rendered = json.dumps(report)
     assert all(secret not in rendered for secret in ("SECRET", "private.invalid", "/private/file", context.session_id))
@@ -577,14 +605,22 @@ async def test_remote_error_keeps_only_known_structured_diagnostics(config, cont
 @pytest.mark.asyncio
 @pytest.mark.parametrize("sse,status", [(False, 200), (True, 200), (False, 503)])
 async def test_callback_error_response_retains_safe_upstream_fields(config, context, sse, status):
-    payload = {"error": {
-        "code": "context_length_exceeded", "type": "invalid_request_error",
-        "message": "TOP_SECRET https://private.invalid /private/file", "param": "TOP_SECRET",
-    }}
+    payload = {
+        "error": {
+            "code": "context_length_exceeded",
+            "type": "invalid_request_error",
+            "message": "TOP_SECRET https://private.invalid /private/file",
+            "param": "TOP_SECRET",
+        }
+    }
     body = ("data: " + json.dumps(payload) + "\n\ndata: [DONE]\n\n").encode() if sse else json.dumps(payload).encode()
-    response = httpx.Response(status, content=body, headers={
-        "content-type": "text/event-stream" if sse else "application/json",
-    })
+    response = httpx.Response(
+        status,
+        content=body,
+        headers={
+            "content-type": "text/event-stream" if sse else "application/json",
+        },
+    )
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: response)) as backend:
         async with CallbackRecorder(config, context, client=backend) as recorder:
             async with httpx.AsyncClient(trust_env=False) as caller:
@@ -597,10 +633,14 @@ async def test_callback_error_response_retains_safe_upstream_fields(config, cont
             code = "callback_error_response" if status == 200 else "callback_upstream_http_error"
             assert observed.content == body and observed.status_code == status
             assert recorder.capture.errors == [code] and recorder.capture.records == []
-            assert recorder.capture.diagnostics == [{
-                "index": 0, "code": code, "http_status": status,
-                "upstream": {"code": "context_length_exceeded", "type": "invalid_request_error"},
-            }]
+            assert recorder.capture.diagnostics == [
+                {
+                    "index": 0,
+                    "code": code,
+                    "http_status": status,
+                    "upstream": {"code": "context_length_exceeded", "type": "invalid_request_error"},
+                }
+            ]
             assert "TOP_SECRET" not in json.dumps(recorder.capture.diagnostics)
 
 
@@ -642,12 +682,16 @@ async def test_dynamic_callback_segment_commit_is_transactional(config, context,
             async with httpx.AsyncClient(trust_env=False) as caller:
                 url = recorder.public_base_url + "/v1/chat/completions"
                 headers = {"Authorization": "Bearer " + context.session_id}
-                await caller.post(url, json={"messages": [{"role": "user", "content": [image_part(red)]}]}, headers=headers)
+                await caller.post(
+                    url, json={"messages": [{"role": "user", "content": [image_part(red)]}]}, headers=headers
+                )
                 await recorder.wait_idle()
                 before_history = copy.deepcopy(recorder.history.messages)
                 before_media = copy.deepcopy(media._committed_messages)
                 before_revision = media._revision
-                await caller.post(url, json={"messages": [{"role": "user", "content": [image_part(blue)]}]}, headers=headers)
+                await caller.post(
+                    url, json={"messages": [{"role": "user", "content": [image_part(blue)]}]}, headers=headers
+                )
                 await recorder.wait_idle()
             assert images(calls[0]) == [red] and images(calls[1]) == [blue]
             if failure:
@@ -658,3 +702,73 @@ async def test_dynamic_callback_segment_commit_is_transactional(config, context,
                 assert len(recorder.capture.records) == 2 and not recorder.capture.errors
                 assert recorder.capture.records[1]["media"]["dynamic_images"]["segment_reset"]
                 assert images({"messages": media._committed_messages}) == [blue]
+
+
+@pytest.mark.asyncio
+async def test_first_callback_signal_precedes_model_response(config, context):
+    entered_backend = asyncio.Event()
+    release_model = asyncio.Event()
+
+    async def upstream(_request):
+        assert recorder.first_callback_started.is_set()
+        entered_backend.set()
+        await release_model.wait()
+        return completion()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as backend:
+        async with CallbackRecorder(config, context, client=backend) as recorder:
+            assert not recorder.first_callback_started.is_set()
+            async with httpx.AsyncClient(trust_env=False) as caller:
+                task = asyncio.create_task(
+                    caller.post(
+                        recorder.public_base_url + "/v1/chat/completions",
+                        json={"messages": [{"role": "user", "content": "fixture"}]},
+                        headers={"Authorization": "Bearer " + context.session_id},
+                    )
+                )
+                try:
+                    await asyncio.wait_for(entered_backend.wait(), timeout=1)
+                    assert recorder.first_callback_started.is_set()
+                    assert not task.done()
+                    assert not recorder.capture.records
+                    release_model.set()
+                    response = await asyncio.wait_for(task, timeout=1)
+                    assert response.status_code == 200
+                finally:
+                    release_model.set()
+                    if not task.done():
+                        task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["authentication", "payload", "media", "history"])
+async def test_rejected_callback_does_not_disable_preparation_deadline(config, context, invalid):
+    class InvalidPlan:
+        def fork(self):
+            return self
+
+        def restore(self, _payload):
+            raise AdapterError("media_plan_invalid" if invalid == "media" else "history_messages_invalid")
+
+    async def upstream(_request):
+        pytest.fail("a rejected callback must not reach the model")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as backend:
+        async with CallbackRecorder(config, context, client=backend) as recorder:
+            if invalid == "media":
+                recorder.media = InvalidPlan()
+            elif invalid == "history":
+                recorder.history = InvalidPlan()
+            async with httpx.AsyncClient(trust_env=False) as caller:
+                response = await caller.post(
+                    recorder.public_base_url + "/v1/chat/completions",
+                    json={} if invalid == "payload" else {"messages": [{"role": "user", "content": "fixture"}]},
+                    headers={
+                        "Authorization": "Bearer " + ("wrong" if invalid == "authentication" else context.session_id)
+                    },
+                )
+            assert (
+                response.status_code == {"authentication": 401, "payload": 400, "media": 502, "history": 502}[invalid]
+            )
+            assert not recorder.first_callback_started.is_set()

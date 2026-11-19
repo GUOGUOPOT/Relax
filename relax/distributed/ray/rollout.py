@@ -1291,6 +1291,8 @@ class RolloutManager(ReloadableMixin):
         try:
             await self.data_source.load.remote(rollout_id)
         except Exception as e:
+            if getattr(self.args, "strict_checkpoint_resume", False):
+                raise
             logger.warning(f"Failed to load data source: {e}")
 
     async def offload(self):

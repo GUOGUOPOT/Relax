@@ -106,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         if json.loads(Path(args.compiler_defaults).read_text()) != {"thinking": True}:
             raise TrainingInputError("training_compiler_defaults_mismatch")
         stage = "agent_config"
-        config = AdapterConfig.from_payload(json.loads(Path(args.agent_config).read_text()))
+        config = AdapterConfig.from_file(args.agent_config)
         if config.max_tokens != 8192:
             raise TrainingInputError("training_max_tokens_not_frozen_contract")
         stage = "callback_host_map"

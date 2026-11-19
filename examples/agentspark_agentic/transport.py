@@ -1,17 +1,33 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""AgentSpark Eden transport. No automatic request retries or invented cancellation API."""
+"""AgentSpark Eden transport.
+
+No automatic request retries or invented cancellation API.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import json
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
+from .diagnostics import UpstreamDiagnosticError, sse_admission_rejection_reason
+from .error_observation import observe_error_payload
 from .protocol import SEND_PATH, SESSION_PATH, AdapterConfig, AdapterError, RelaxContext
+
+
+class ReplayUnavailableError(AdapterError):
+    """A complete replay stream explicitly rejected before any
+    acknowledgement."""
+
+    def __init__(self, reason_code: str = "eden_sse_rate_limiter_unavailable") -> None:
+        super().__init__("replay_temporarily_unavailable")
+        self.safe_diagnostic = {"reason_code": reason_code, "phase": "replay"}
 
 
 @dataclass(frozen=True)
@@ -35,7 +51,8 @@ class SSEEvent:
 
 
 async def iter_sse(response: httpx.Response, *, max_frame_bytes: int = 16 * 1024 * 1024) -> AsyncIterator[SSEEvent]:
-    """Split only on LF bytes; Unicode line separators are valid JSON content."""
+    """Split only on LF bytes; Unicode line separators are valid JSON
+    content."""
     pending = bytearray()
     event_name: str | None = None
     data: list[str] = []
@@ -100,6 +117,7 @@ class AgentSparkClient:
         self.config = config
         self._client = client
         self._owned = client is None
+        self.error_observations: list[dict[str, Any]] = []
 
     async def __aenter__(self) -> "AgentSparkClient":
         if self._client is None:
@@ -148,6 +166,9 @@ class AgentSparkClient:
     async def events(self, body: dict[str, Any]) -> AsyncIterator[SSEEvent]:
         if self._client is None:
             raise AdapterError("client_not_open")
+        started_unix_ms = time.time_ns() // 1_000_000
+        started = time.monotonic()
+        frames = 0
         try:
             async with self._client.stream(
                 "POST",
@@ -156,8 +177,45 @@ class AgentSparkClient:
                 headers={"Accept": "text/event-stream"},
             ) as response:
                 if not 200 <= response.status_code < 300:
+                    # Observe only the status; do not consume an error response body.
+                    try:
+                        phase = "replay" if isinstance(body.get("replay_spec"), dict) else "send"
+                        self.error_observations.append(
+                            {
+                                "request_started_unix_ms": started_unix_ms,
+                                "error_unix_ms": time.time_ns() // 1_000_000,
+                                "elapsed_ms": int((time.monotonic() - started) * 1000),
+                                "frames_before_error": frames,
+                                "transport_http_status": response.status_code,
+                                "detail": observe_error_payload({}, http_status=response.status_code, phase=phase),
+                            }
+                        )
+                        del self.error_observations[:-4]
+                    except Exception:
+                        pass
                     raise AdapterError("agentspark_http_error")
                 async for event in iter_sse(response, max_frame_bytes=self.config.max_callback_bytes):
+                    if event.is_error:
+                        # Observation never changes the control-path error classification.
+                        try:
+                            phase = "replay" if isinstance(body.get("replay_spec"), dict) else "send"
+                            self.error_observations.append(
+                                {
+                                    "request_started_unix_ms": started_unix_ms,
+                                    "error_unix_ms": time.time_ns() // 1_000_000,
+                                    "elapsed_ms": int((time.monotonic() - started) * 1000),
+                                    "frames_before_error": frames,
+                                    "transport_http_status": response.status_code,
+                                    "event_raw_sha256": hashlib.sha256(event.raw.encode("utf-8")).hexdigest(),
+                                    "detail": observe_error_payload(
+                                        event.payload, http_status=response.status_code, phase=phase
+                                    ),
+                                }
+                            )
+                            del self.error_observations[:-4]
+                        except Exception:
+                            pass
+                    frames += 1
                     yield event
         except httpx.HTTPError as exc:
             # Never repeat a POST: the server may already have executed tools.
@@ -165,10 +223,32 @@ class AgentSparkClient:
 
     async def restore(self, body: dict[str, Any]) -> str:
         session_id: str | None = None
+        rejection: UpstreamDiagnosticError | None = None
+        rejection_reason: str | None = None
         async for event in self.events(body):
             payload = event.payload
+            if rejection is not None:
+                # Any further event makes the attempt ambiguous, including an ack
+                # after an apparent rejection. Never permit a retry in that case.
+                raise rejection
             if event.is_error:
-                raise AdapterError("replay_error_event")
+                failure = UpstreamDiagnosticError("replay_error_event", payload)
+                failure.safe_diagnostic["phase"] = "replay"
+                admission_reason = sse_admission_rejection_reason(payload)
+                if (
+                    isinstance(body.get("replay_spec"), dict)
+                    and body["replay_spec"].get("replay_type") == "restore_only"
+                    and session_id is None
+                    and event.event in {None, "error", "agent.stream.error"}
+                    and event.kind in {"error", "agent.stream.error"}
+                    and admission_reason is not None
+                ):
+                    # Admission may be retried by the caller only after clean EOF;
+                    # errors/acks following this frame must still fail closed.
+                    rejection = failure
+                    rejection_reason = admission_reason
+                    continue
+                raise failure
             if (
                 event.event not in {None, "link.up.ack"}
                 or event.kind not in {None, "link.up.ack"}
@@ -184,6 +264,8 @@ class AgentSparkClient:
             if session_id is not None and session_id != candidate:
                 raise AdapterError("replay_ack_session_inconsistent")
             session_id = candidate
+        if rejection is not None:
+            raise ReplayUnavailableError(rejection_reason)
         if session_id is None:
             raise AdapterError("replay_eof_without_ack")
         return session_id

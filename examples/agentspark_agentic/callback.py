@@ -1,13 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Narrow transparent Chat callback recorder; Relax remains the token/state owner."""
+"""Narrow transparent Chat callback recorder; Relax remains the token/state
+owner."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import hmac
-import json
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -24,7 +24,8 @@ from .transport import iter_sse
 
 
 async def assistant_from_response(body: bytes, content_type: str) -> dict[str, Any]:
-    """Read the actual Relax JSON or single-terminal-chunk Buffered SSE response."""
+    """Read the actual Relax JSON or single-terminal-chunk Buffered SSE
+    response."""
     if "text/event-stream" in content_type:
         payloads = []
         saw_done = False
@@ -89,7 +90,8 @@ class CallbackCapture:
     started: int = 0
 
     def linear_candidate(self) -> dict[str, Any]:
-        """Prove payload append-only shape, not committed Forest identity or reward parity."""
+        """Prove payload append-only shape, not committed Forest identity or
+        reward parity."""
         if self.errors or self.active or self.concurrent or not self.records or self.started != len(self.records):
             raise AdapterError("callback_capture_incomplete_or_concurrent")
         expected: list[dict[str, Any]] | None = None
@@ -129,9 +131,10 @@ class CallbackCapture:
 class CallbackRecorder:
     """One explicitly advertised, authenticated per-invocation callback server.
 
-    Body bytes are unchanged unless an explicit private media plan restores them.
-    Both raw and actual forwarded payloads are then captured. Captures omit headers and any raw error
-    response. The output is audit evidence, never a Relax training publication.
+    Body bytes are unchanged unless an explicit private media plan restores
+    them. Both raw and actual forwarded payloads are then captured. Captures
+    omit headers and any raw error response. The output is audit evidence,
+    never a Relax training publication.
     """
 
     def __init__(
@@ -155,6 +158,7 @@ class CallbackRecorder:
         self._client = client
         self._owned = client is None
         self._runner: web.AppRunner | None = None
+        self.first_callback_started = asyncio.Event()
         self._idle = asyncio.Event()
         self._idle.set()
 
@@ -277,7 +281,11 @@ class CallbackRecorder:
                 if self.capture.active > 1:
                     raise AdapterError("history_concurrent_callback_unsupported")
                 payload, history_evidence = self.history.restore(payload)
-                if self.media is not None and self.allow_dynamic_images and history_evidence["status"] == "new_segment":
+                if (
+                    self.media is not None
+                    and self.allow_dynamic_images
+                    and history_evidence["status"] == "new_segment"
+                ):
                     # A reset is transactional too: recompute from the raw callback
                     # so no media admission from the abandoned segment survives.
                     candidate_media = self.media.fork(reset_segment=True)
@@ -287,6 +295,9 @@ class CallbackRecorder:
                 body = canonical_bytes(payload)
                 if len(body) > self.config.max_callback_bytes:
                     raise AdapterError("callback_forwarded_request_too_large")
+            # Preparation ends after validation, before the model/group barrier
+            # can hold this request. The Send watchdog must not time that wait.
+            self.first_callback_started.set()
             async with self._client.stream(
                 "POST",
                 self.context.base_url + CHAT_PATH,
@@ -345,12 +356,14 @@ class CallbackRecorder:
         except (Exception, asyncio.CancelledError) as exc:
             code = exc.code if isinstance(exc, AdapterError) else "callback_forward_failed"
             self.capture.errors.append(code)
-            self.capture.diagnostics.append({
-                "index": index,
-                "code": code,
-                "http_status": upstream_status,
-                "upstream": upstream_diagnostic(getattr(exc, "safe_diagnostic", None)),
-            })
+            self.capture.diagnostics.append(
+                {
+                    "index": index,
+                    "code": code,
+                    "http_status": upstream_status,
+                    "upstream": upstream_diagnostic(getattr(exc, "safe_diagnostic", None)),
+                }
+            )
             if isinstance(exc, asyncio.CancelledError):
                 raise
             if outgoing is not None:

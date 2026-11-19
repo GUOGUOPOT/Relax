@@ -27,6 +27,7 @@ from relax.utils.opd.opd_utils import (
     validate_opd_topk_gather,
 )
 from relax.utils.replay import capture_hooks
+from relax.utils.score_centering import score_centering_enabled
 from relax.utils.training.fused_ce import ce_implementation, te_cross_entropy
 from relax.utils.training.loss_extensions import PolicyLossContext, PolicyLossExtension, validate_addon
 from relax.utils.training.ppo_utils import (
@@ -413,10 +414,7 @@ def get_log_probs_and_entropy(
     """
     assert non_loss_data
 
-    is_score_centering = (
-        getattr(args, "advantage_estimator", None) is not None
-        and get_algorithm(args.advantage_estimator).policy_loss_fn == "score_centering"
-    )
+    is_score_centering = score_centering_enabled(args)
     if not is_score_centering:
         validate_opd_topk_gather(args, gather_topk_token_ids)
     sc_cp_size = dynamic_cp_size

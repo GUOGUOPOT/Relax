@@ -1,10 +1,12 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import gc
+import os
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from functools import wraps
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -108,7 +110,7 @@ def clear_memory(clear_host_memory: bool = False):
 def available_memory():
     dev = device_module.current_device()
     free, total = device_module.mem_get_info(dev)
-    return {
+    memory = {
         "device": str(dev),
         "total_GB": _byte_to_gb(total),
         "free_GB": _byte_to_gb(free),
@@ -116,6 +118,33 @@ def available_memory():
         "allocated_GB": _byte_to_gb(device_module.memory_allocated(dev)),
         "reserved_GB": _byte_to_gb(device_module.memory_reserved(dev)),
     }
+    memory.update(_host_memory_usage())
+    return memory
+
+
+def _host_memory_usage() -> dict[str, float]:
+    """Opt-in Linux RSS and pinned storage; VmHWM is a process lifetime
+    peak."""
+    if os.environ.get("RELAX_LOG_HOST_MEMORY", "0") != "1":
+        return {}
+    memory = {}
+    try:
+        fields = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines())
+        for source, target in (("VmRSS", "cpu_rss_GB"), ("VmHWM", "cpu_lifetime_peak_rss_GB")):
+            if source in fields:
+                memory[target] = _byte_to_gb(int(fields[source].split()[0]) * 1024)
+        host_stats = getattr(torch.cuda.memory, "host_memory_stats", None)
+        if torch.cuda.is_initialized() and callable(host_stats):
+            stats = host_stats()
+            for source, target in (
+                ("active_bytes.current", "pinned_active_GB"),
+                ("allocated_bytes.current", "pinned_reserved_GB"),
+            ):
+                if source in stats:
+                    memory[target] = _byte_to_gb(stats[source])
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning("Host memory diagnostics unavailable: %s", exc)
+    return memory
 
 
 def _byte_to_gb(n: int):
@@ -177,6 +206,7 @@ def log_step_peak_memory(rollout_id: int, step: int, ranks: dict[str, int], role
                 "peak_allocated_GB": _byte_to_gb(allocated),
                 "peak_reserved_GB": _byte_to_gb(reserved),
             }
+            memory.update(_host_memory_usage())
             # Ray ignores words containing digits when deduplicating worker logs.
             # Keep a separate all-letter identity so every rank and step survives.
             key = f"{role}-rank-{ranks['global_rank']}-rollout-{rollout_id}-step-{step}".translate(

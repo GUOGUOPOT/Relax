@@ -1909,6 +1909,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             reset_arg(parser, "--save-interval", type=int, default=None)
             reset_arg(parser, "--async-save", action="store_true")
             parser.add_argument(
+                "--strict-checkpoint-resume",
+                action="store_true",
+                help="Require full native model/optimizer/scheduler/RNG and matching eager RL dataset state.",
+            )
+            parser.add_argument(
+                "--save-dataset-before-checkpoint",
+                action="store_true",
+                help="Persist the eager RL dataset cursor before publishing a synchronous colocated checkpoint.",
+            )
+            parser.add_argument(
                 "--save-lora-only",
                 action="store_true",
                 default=False,
@@ -3684,12 +3694,21 @@ def _assert_spec_implementations_resolve(spec) -> None:
 
 
 def _validate_score_centering_args(args: argparse.Namespace) -> None:
-    if args.advantage_estimator != "score_centering":
+    from relax.utils.score_centering import (
+        score_centering_allows_multimodal,
+        score_centering_custom_loss,
+        score_centering_enabled,
+    )
+
+    if not score_centering_enabled(args):
         return
-    if args.loss_type != "policy_loss":
+    custom = score_centering_custom_loss(args)
+    if args.loss_type != "policy_loss" and custom is None:
         raise ValueError("score_centering requires --loss-type policy_loss.")
-    if getattr(args, "multimodal_keys", None):
-        raise ValueError("score_centering currently accepts text-only training inputs.")
+    if getattr(args, "multimodal_keys", None) and not score_centering_allows_multimodal(args):
+        raise ValueError(
+            "score_centering currently accepts text-only training inputs outside an opted-in agentic loss."
+        )
     if getattr(args, "train_backend", None) == "fsdp":
         raise ValueError(
             "score_centering requires a text token policy-loss backend; the current FSDP backend trains diffusion."
@@ -4345,7 +4364,9 @@ def slime_validate_args(args):
         if args.use_rollout_logprobs:
             assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
 
-        if args.get_mismatch_metrics and args.advantage_estimator != "score_centering":
+        from relax.utils.score_centering import score_centering_enabled
+
+        if args.get_mismatch_metrics and not score_centering_enabled(args):
             assert args.custom_tis_function_path is not None, (
                 "custom_tis_function_path must be set when get_mismatch_metrics is set"
             )

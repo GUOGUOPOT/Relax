@@ -27,6 +27,7 @@
 # attribute attached to each flat buffer.
 
 import os
+from collections.abc import Iterable
 from contextlib import nullcontext
 from typing import ContextManager, Iterator, List, Optional, Protocol
 
@@ -177,6 +178,69 @@ class _SelectiveOffloadStrategy:
     @staticmethod
     def _param_index_map(buffer) -> dict:
         return getattr(buffer, "param_index_map", None) or getattr(buffer, "param_to_index", {})
+
+    def initialize_actor_backup(
+        self, named_tensors: Iterable[tuple[str, torch.Tensor]], actor_backup: dict[str, torch.Tensor]
+    ) -> bool:
+        """Seed the actor snapshot with views of the existing sleep/wake host
+        storage.
+
+        Call before the first actor backup. Other tags and tensors outside DDP
+        buffers retain TensorBackuper's normal allocation. Unsupported layouts
+        retain separate backups; no GPU storage is changed here.
+        """
+        if actor_backup:
+            raise ValueError("Actor backup must be empty before sharing selective offload storage.")
+        named_tensors = list(named_tensors)
+        named_ids = {id(tensor) for _, tensor in named_tensors}
+        buffers = list(self._iter_ddp_buffers())
+        grad_storages = {buffer.grad_data.untyped_storage() for buffer in buffers if buffer.grad_data is not None}
+        cpu_views = {}
+        for buffer in buffers:
+            flat = buffer.param_data
+            if flat is None:
+                continue
+            mapping = self._param_index_map(buffer)
+            # Quantized wrappers and shared param/grad storage need different
+            # layouts. Only ordinary contiguous DDP parameter views can alias.
+            compatible = (
+                type(flat) is torch.Tensor
+                and flat.ndim == 1
+                and flat.is_contiguous()
+                and flat.storage_offset() == 0
+                and flat.untyped_storage().nbytes() == flat.numel() * flat.element_size()
+                and flat.untyped_storage() not in grad_storages
+                and bool(mapping)
+            )
+            previous_end = 0
+            for param, (start, end, *_rest) in sorted(mapping.items(), key=lambda item: item[1][0]):
+                compatible = compatible and (
+                    type(param) in (torch.Tensor, torch.nn.Parameter)
+                    and id(param) in named_ids
+                    and param.dtype == flat.dtype
+                    and param.is_contiguous()
+                    and param.untyped_storage() == flat.untyped_storage()
+                    and param.storage_offset() == start
+                    and previous_end <= start <= end <= flat.numel()
+                    and end - start == param.numel()
+                )
+                previous_end = end
+            if not compatible:
+                logger.warning("DDP buffer layout cannot share the actor CPU backup; keeping separate backups.")
+                continue
+            cpu_data = getattr(flat, "cpu_data", None)
+            if cpu_data is None:
+                cpu_data = torch.empty_like(flat, device="cpu", pin_memory=_PIN_MEMORY)
+                flat.cpu_data = cpu_data
+            elif cpu_data.device.type != "cpu" or cpu_data.shape != flat.shape or cpu_data.dtype != flat.dtype:
+                raise ValueError("Existing selective offload CPU storage does not match the DDP buffer.")
+            for param, (start, end, *_rest) in mapping.items():
+                cpu_views[id(param)] = cpu_data[start:end].view(param.shape)
+        actor_backup.update({name: cpu_views[id(tensor)] for name, tensor in named_tensors if id(tensor) in cpu_views})
+        if cpu_views:
+            shared_bytes = sum(tensor.numel() * tensor.element_size() for tensor in cpu_views.values())
+            logger.info(f"Actor snapshot shares selective offload CPU storage: {shared_bytes / 2**30:.2f} GiB saved.")
+        return bool(cpu_views)
 
     @torch.no_grad()
     def _clear_moe_dispatcher_caches(self) -> None:
@@ -369,6 +433,7 @@ class MegatronTrainStateOffloader:
     def __init__(self, model: Optional[List], optimizer, args) -> None:
         self.enabled: bool = bool(getattr(args, "offload_train", False))
         self.uses_tms: bool = False
+        self.shares_actor_backup: bool = False
 
         # Default is torch_memory_saver; --selective-offload forces the selective path.
         force_selective = bool(getattr(args, "selective_offload", False))
@@ -412,6 +477,12 @@ class MegatronTrainStateOffloader:
                 "falling back to selective offload."
             )
             return False
+
+    def initialize_actor_backup(
+        self, named_tensors: Iterable[tuple[str, torch.Tensor]], actor_backup: dict[str, torch.Tensor]
+    ) -> None:
+        if self.enabled and isinstance(self._strategy, _SelectiveOffloadStrategy):
+            self.shares_actor_backup = self._strategy.initialize_actor_backup(named_tensors, actor_backup)
 
     def offload(self) -> None:
         """Offload the train state off the device (sleep).

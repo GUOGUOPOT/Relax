@@ -1468,7 +1468,13 @@ async def _take_session_results(
     session_ids = tuple(result.session_id for result in results)
     try:
         session_results = await stream.shard.handle.take_session_results.remote(stream.group_id, session_ids)
-        for result, session_result in zip(results, session_results, strict=True):
+        # Resolve fatal results before controlled drops: a False first-IR
+        # barrier cannot later be replaced by an exception from the same batch.
+        ordered_results = sorted(
+            zip(results, session_results, strict=True),
+            key=lambda item: not isinstance(item[1], RuntimeGroupError),
+        )
+        for result, session_result in ordered_results:
             _resolve_session_export(stream, result, session_result)
     except Exception as error:
         for result in results:

@@ -1,4 +1,5 @@
-"""Offline regressions for prepared inputs and AgentSpark's one-shot SSE protocol."""
+"""Offline regressions for prepared inputs and AgentSpark's one-shot SSE
+protocol."""
 
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ from examples.agentspark_agentic.protocol import (
     replay_body,
     send_body,
 )
-from examples.agentspark_agentic.transport import AgentSparkClient, SSEEvent, iter_sse
+from examples.agentspark_agentic.transport import AgentSparkClient, ReplayUnavailableError, SSEEvent, iter_sse
 
 
 def _config() -> AdapterConfig:
@@ -387,3 +388,128 @@ def test_session_lookup_preserves_service_prefix_and_scoped_user() -> None:
     assert request.method == "GET"
     assert request.url.path == "/service/eden/diandian/session"
     assert dict(request.url.params) == {"user_id": context.user_id, "source": "eden"}
+
+
+def _admission_rejection() -> dict[str, Any]:
+    return {
+        "message": "Eden SSE rate limiter unavailable: total",
+        "request_id": "PRIVATE_REQUEST_ID",
+        "error_detail": {"code": "EDEN_REQUEST_INVALID", "stage": "request_validation"},
+    }
+
+
+@pytest.mark.parametrize(
+    "message,reason",
+    [
+        ("Eden SSE rate limiter unavailable: total", "eden_sse_rate_limiter_unavailable"),
+        ("Eden SSE rate limit exceeded: total", "eden_sse_rate_limit_exceeded_total"),
+        ("Eden SSE rate limit exceeded: source", "eden_sse_rate_limit_exceeded_source"),
+    ],
+)
+def test_replay_classifies_explicit_admission_rejection_only_after_clean_eof(message, reason) -> None:
+    requests: list[httpx.Request] = []
+    stream = _Chunks([_frame({**_admission_rejection(), "message": message}, "error")])
+
+    async def run() -> None:
+        async def handle(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, stream=stream)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            async with AgentSparkClient(_config(), client=client) as agentspark:
+                await agentspark.restore({"replay_spec": {"replay_type": "restore_only"}})
+
+    with pytest.raises(ReplayUnavailableError, match="^replay_temporarily_unavailable$") as failure:
+        asyncio.run(run())
+    assert len(requests) == 1
+    assert stream.finished and stream.closed
+    assert failure.value.safe_diagnostic == {
+        "reason_code": reason,
+        "phase": "replay",
+    }
+    assert "PRIVATE" not in str(failure.value) + json.dumps(failure.value.safe_diagnostic)
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        _frame(_ack()) + _frame(_admission_rejection(), "error"),
+        _frame(_admission_rejection(), "error") + _frame(_ack()),
+        _frame(_admission_rejection(), "error") * 2,
+        _frame(_admission_rejection(), "error") + _frame({"type": "agent.stream.end"}),
+        _frame({**_admission_rejection(), "type": "link.up.ack"}, "error"),
+        _frame({**_admission_rejection(), "type": "error"}, "snapshot"),
+        _frame({"message": "Eden SSE rate limiter unavailable: unknown"}, "error"),
+        _frame({"message": "Eden SSE rate limiter unavailable: source"}, "error"),
+        _frame({"message": "Eden SSE rate limit exceeded: unknown"}, "error"),
+        _frame({"message": {"message": "Eden SSE rate limit exceeded: source"}}, "error"),
+        _frame({"error_detail": {"message": "Eden SSE rate limit exceeded: source"}}, "error"),
+        _frame({"message": "Eden SSE rate limiter unavailable: total PRIVATE"}, "error"),
+        _frame({"code": "rate_limit_exceeded", "status": 429}, "error"),
+        _frame({"reason_code": "eden_sse_rate_limiter_unavailable"}, "error"),
+    ],
+)
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Eden SSE rate limiter unavailable: total",
+        "Eden SSE rate limit exceeded: total",
+        "Eden SSE rate limit exceeded: source",
+    ],
+)
+def test_replay_does_not_retry_ambiguous_or_unrecognized_rejections(wire: bytes, message: str) -> None:
+    wire = wire.replace(b"Eden SSE rate limiter unavailable: total", message.encode())
+    with pytest.raises(AdapterError, match="^replay_error_event$") as failure:
+        asyncio.run(_restore(wire))
+    assert not isinstance(failure.value, ReplayUnavailableError)
+    assert failure.value.safe_diagnostic["phase"] == "replay"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Eden SSE rate limiter unavailable: total",
+        "Eden SSE rate limit exceeded: total",
+        "Eden SSE rate limit exceeded: source",
+    ],
+)
+def test_replay_rejection_followed_by_connection_failure_is_not_retryable(message) -> None:
+    with pytest.raises(AdapterError, match="^agentspark_transport_error$") as failure:
+        asyncio.run(_restore(_frame({**_admission_rejection(), "message": message}, "error"), fail_after_data=True))
+    assert not isinstance(failure.value, ReplayUnavailableError)
+
+
+def test_replay_permanent_error_preserves_only_safe_diagnostic_fields() -> None:
+    payload = {
+        "type": "error",
+        "message": "PRIVATE_TOKEN /private/path https://private.invalid",
+        "data": {"error": {"code": "context_length_exceeded", "type": "invalid_request_error", "status": 400}},
+    }
+    with pytest.raises(AdapterError, match="^replay_error_event$") as failure:
+        asyncio.run(_restore(_frame(payload)))
+    assert failure.value.safe_diagnostic == {
+        "code": "context_length_exceeded",
+        "type": "invalid_request_error",
+        "status": 400,
+        "phase": "replay",
+    }
+    assert "PRIVATE" not in json.dumps(failure.value.safe_diagnostic)
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_replay_http_overload_is_not_automatically_classified_as_safe_to_repeat(status: int) -> None:
+    requests: list[httpx.Request] = []
+
+    async def run() -> None:
+        async def handle(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(status, json=_admission_rejection())
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            async with AgentSparkClient(_config(), client=client) as agentspark:
+                await agentspark.restore({"replay_spec": {"replay_type": "restore_only"}})
+
+    with pytest.raises(AdapterError, match="^agentspark_http_error$") as failure:
+        asyncio.run(run())
+    assert not isinstance(failure.value, ReplayUnavailableError)
+    assert len(requests) == 1

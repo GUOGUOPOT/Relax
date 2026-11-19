@@ -259,7 +259,18 @@ class RolloutDataSource(DataSource):
 
         path = os.path.join(self.args.save, f"dataset/global_dataset_state_dict_{rollout_id}.pt")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(state_dict, path)
+        from relax.utils.checkpoint_resume import atomic_save_dataset_state, dataset_identity
+
+        if getattr(self.args, "save_dataset_before_checkpoint", False):
+            if self._use_streaming or getattr(self, "buffer", []):
+                raise RuntimeError("Strict checkpoint save requires an eager dataset with no pending sample buffer")
+            state_dict["resume_contract"] = {
+                "version": 1,
+                "rollout_id": rollout_id,
+                "dataset_size": len(self.dataset),
+                **dataset_identity(self.args),
+            }
+        atomic_save_dataset_state(state_dict, path)
 
     def load(self, rollout_id=None):
         if not self.args.rollout_global_dataset:
@@ -279,11 +290,19 @@ class RolloutDataSource(DataSource):
                 logger.warning(f"Loading dataset state from legacy path {legacy_path} (new path: dataset/)")
                 path = legacy_path
             else:
+                if getattr(self.args, "strict_checkpoint_resume", False):
+                    raise RuntimeError(f"Strict resume dataset checkpoint does not exist: {path}")
                 logger.error(f"Checkpoint {path} does not exist.")
                 return
 
         logger.info(f"load metadata from {path}")
-        state_dict = torch.load(path)
+        state_dict = torch.load(path, map_location="cpu", weights_only=False)
+        if getattr(self.args, "strict_checkpoint_resume", False):
+            from relax.utils.checkpoint_resume import validate_dataset_state
+
+            validate_dataset_state(state_dict, self.args, rollout_id)
+            if self.dataset is None or state_dict["resume_contract"]["dataset_size"] != len(self.dataset):
+                raise RuntimeError("Strict resume dataset cursor is outside the current dataset")
         self.sample_offset = state_dict.get("sample_offset", 0)
         self.epoch_id = state_dict.get("epoch_id", 0)
         self.sample_group_index = state_dict.get("sample_group_index", 0)

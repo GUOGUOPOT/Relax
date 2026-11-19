@@ -89,6 +89,7 @@ from relax.utils.reloadable_process_group import destroy_process_groups, monkey_
 from relax.utils.replay import capture_hooks
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
+from relax.utils.score_centering import score_centering_enabled
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
@@ -525,7 +526,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
-        if self.args.advantage_estimator == "score_centering":
+        if score_centering_enabled(self.args):
             text_config = getattr(self.hf_config, "text_config", self.hf_config)
             self.args.score_centering_vocab_size = text_config.vocab_size
         # Hybrid mode uses the TensorBackuper path: actor handles ref/actor_fwd
@@ -538,16 +539,22 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         use_tensor_backuper = not skip_weight_management and (not self.args.fully_async or self.args.hybrid)
         if use_tensor_backuper:
+            source_getter = lambda: named_params_and_buffers(
+                self.args,
+                self.model,
+                convert_to_global_name=args.megatron_to_hf_mode == "raw",
+                translate_gpu_to_cpu=not self.args.enable_weights_backuper,
+                include_persistent_buffers=args.megatron_to_hf_mode == "bridge",
+            )
             self.weights_backuper = TensorBackuper.create(
-                source_getter=lambda: named_params_and_buffers(
-                    self.args,
-                    self.model,
-                    convert_to_global_name=args.megatron_to_hf_mode == "raw",
-                    translate_gpu_to_cpu=not self.args.enable_weights_backuper,
-                    include_persistent_buffers=args.megatron_to_hf_mode == "bridge",
-                ),
+                source_getter=source_getter,
                 single_tag=None if args.enable_weights_backuper else "actor",
             )
+            if self.role == "actor" and args.enable_weights_backuper:
+                # Bind before the first backup to avoid allocating two host copies.
+                self._train_state_offloader.initialize_actor_backup(
+                    source_getter(), self.weights_backuper.get("actor")
+                )
             self._active_model_tag: str | None = "actor"
             self.weights_backuper.backup("actor")
 
@@ -835,6 +842,8 @@ class MegatronTrainRayActor(TrainRayActor):
     @timer
     def sleep(self) -> None:
         assert self.args.offload_train
+        if self._train_state_offloader.shares_actor_backup and self._active_model_tag != "actor":
+            raise RuntimeError("Restore actor weights before sleep: selective offload shares the actor CPU backup.")
         self._flush_resident_sft_parameters()
 
         clear_memory(clear_host_memory=True)
@@ -2613,7 +2622,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     "group_index",
                 ]
                 data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
-                if self.args.advantage_estimator == "score_centering":
+                if score_centering_enabled(self.args):
                     data_fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
                 if self.args.multimodal_keys is not None:
                     data_fields.append("multimodal_train_inputs")
@@ -2804,7 +2813,7 @@ class MegatronTrainRayActor(TrainRayActor):
         ]
         # In true on-policy mode, actor_fwd is absent and old_log_probs is
         # recomputed inline from the train forward (see policy_loss_function).
-        if self.args.advantage_estimator == "score_centering":
+        if score_centering_enabled(self.args):
             data_fields.extend(["rollout_topk_token_ids", "rollout_topk_log_probs"])
         if not getattr(self.args, "true_on_policy_mode", False):
             data_fields.append("log_probs")
@@ -2932,6 +2941,21 @@ class MegatronTrainRayActor(TrainRayActor):
         # touch GPU tensors.
         if self.args.offload_train and self._per_step_rollout:
             reload_process_groups()
+
+        if self.role == "actor" and getattr(self.args, "save_dataset_before_checkpoint", False):
+            from relax.backends.megatron.checkpoint_metadata import _collective_checkpoint_probe
+            from relax.utils.checkpoint_resume import validate_strict_rl_checkpoint_mode
+
+            def save_dataset():
+                validate_strict_rl_checkpoint_mode(self.args)
+                if self.args.no_save_optim or self.args.no_save_rng:
+                    raise RuntimeError("Dataset-first checkpoint save requires optimizer and RNG state")
+                if dist.get_rank(group=get_gloo_group()) == 0:
+                    ray.get(self.rollout_manager.save.remote(rollout_id))
+
+            # Publish the model tracker only after the matching cursor is durable.
+            # Every rank agrees on failure before entering native DCP collectives.
+            _collective_checkpoint_probe(save_dataset)
 
         if self.args.async_save:
             from megatron.training.async_utils import maybe_finalize_async_save

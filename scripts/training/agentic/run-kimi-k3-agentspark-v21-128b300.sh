@@ -206,14 +206,13 @@ SGLANG_ARGS=(
     --sglang-watchdog-timeout 3600
 )
 METRICS_ARGS=(
+    --use-clearml
     --use-tensorboard
     --use-metrics-service
     --tb-project-name "${PROJECT_NAME}"
     --tb-experiment-name "${EXP_NAME}-${now}"
 )
-if [ "${USE_CLEARML:-0}" = 1 ]; then
-    METRICS_ARGS+=(--use-clearml)
-fi
+
 TRAIN_ARGS=(
     --resource '{"actor": [1, 128], "rollout": [1, 128]}'
     --num-gpus-per-node 8

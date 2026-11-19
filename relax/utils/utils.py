@@ -18,6 +18,7 @@ from relax.utils.device import get_ray_accelerator_name
 from relax.utils.env import KERNEL_CACHE_ENV_NAMES, Envs, validate_env
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
+from relax.utils.score_centering import score_centering_allows_multimodal, score_centering_enabled
 from relax.utils.types import Sample
 
 
@@ -96,7 +97,7 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     if custom_convert_path is not None:
         custom_convert_func = load_function(custom_convert_path)
         train_data = custom_convert_func(args, samples)
-        if getattr(args, "advantage_estimator", None) == "score_centering":
+        if score_centering_enabled(args):
             from relax.utils.score_centering import SCORE_CENTERING_FIELDS
 
             missing = [field for field in (*SCORE_CENTERING_FIELDS, "rollout_log_probs") if field not in train_data]
@@ -161,7 +162,7 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     if samples[0].rollout_log_probs is not None:
         train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
 
-    if getattr(args, "advantage_estimator", None) == "score_centering":
+    if score_centering_enabled(args):
         from relax.utils.score_centering import (
             SCORE_CENTERING_FIELDS,
             resolve_score_centering_vocab_size,
@@ -170,7 +171,12 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
 
         sc_vocab_size = resolve_score_centering_vocab_size(args)
         for sample in samples:
-            validate_score_centering_sample(sample, args.rollout_top_logprobs_num, vocab_size=sc_vocab_size)
+            validate_score_centering_sample(
+                sample,
+                args.rollout_top_logprobs_num,
+                vocab_size=sc_vocab_size,
+                allow_multimodal=score_centering_allows_multimodal(args),
+            )
         for field in SCORE_CENTERING_FIELDS:
             # TQ's numeric nested-list path expects one flat variable-length row
             # per sample. Restore [R, K] at the training ingestion boundary.

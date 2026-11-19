@@ -284,9 +284,7 @@ def auxiliary_loss(args: Any, batch: dict, context: PolicyLossContext) -> Policy
     return PolicyLossAddon(terms, ref_terms, metrics)
 
 
-def loss(args: Any, batch: dict, logits: torch.Tensor, reducer):
-    from relax.backends.megatron.loss import policy_loss_function
-
+def validate_binding(args: Any) -> None:
     bound_options = getattr(args, "agentspark_v21_loss_options", None)
     if not isinstance(bound_options, dict) or set(bound_options) != {*DEFAULTS, "followup_token_credit"}:
         raise ValueError("V21 requires generated source-backed training overrides")
@@ -297,6 +295,12 @@ def loss(args: Any, batch: dict, logits: torch.Tensor, reducer):
         raise ValueError("V21 requires generated main-objective overrides")
     if any(getattr(args, name, None) != value for name, value in bound_main.items()):
         raise ValueError("V21 main objective changed after source binding")
+
+
+def loss(args: Any, batch: dict, logits: torch.Tensor, reducer):
+    from relax.backends.megatron.loss import policy_loss_function
+
+    validate_binding(args)
     return policy_loss_function(
         args,
         prepare_batch(args, batch),

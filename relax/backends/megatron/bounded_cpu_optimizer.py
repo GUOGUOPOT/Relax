@@ -2,10 +2,11 @@
 
 """Opt-in, bounded gradient staging for Megatron's overlapping CPU AdamW.
 
-Keep native masters, moments, checkpoint mappings and parameter-copy hooks. Only
-replace HDO's eager allocation of one permanent CPU gradient per parameter with
-one FP32 workspace per HDO. CPU updates are serialized, trading transfer overlap
-for host memory. CUDA validation is required before production acceptance.
+Keep native masters, moments, checkpoint mappings and parameter-copy hooks.
+Only replace HDO's eager allocation of one permanent CPU gradient per parameter
+with one FP32 workspace per HDO. CPU updates are serialized, trading transfer
+overlap for host memory. CUDA validation is required before production
+acceptance.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from relax.utils.logging_utils import get_logger
 
+
 if TYPE_CHECKING:
     import torch
 
@@ -32,7 +34,12 @@ _MARKER = "_relax_bounded_cpu_grads"
 _NATIVE_CONTRACT = {
     "step": "27b34f1f53c9b2fd74a61f043efd2f46c5040376dcb1fed0337553c25a3849ee",
     "_set_sub_optimizer_grads": "dbf65bcbcc14002d2696b020bd36547412553d4c66852ec2afa0889c4b7caf3d",
-    "_register_param_copy_back_gpu_hook": "877649e152728d6788493f4b187aa0dd07bf3a07d47e7118167bcb42124c99e0",
+    "_register_param_copy_back_gpu_hook": (
+        "877649e152728d6788493f4b187aa0dd07bf3a07d47e7118167bcb42124c99e0",
+        # Adds optional per-parameter copy-back callbacks inside the same H2D
+        # stream/event fences. child.step() below preserves this native hook.
+        "b058957e84ffb165b6e4479f331e91a7849cd5ad2aa3c15261f9061926902efd",
+    ),
     "_init_sub_optimizers": "ee832379cba3519c26f8ec189e4fedad65a48b95d1fff175acb2fb2a7bc42d54",
     "build_cpu_optimizer_list": "68eea6da0e856fc9698663ce016def14c4ee447c7d8917d6c61b0d9a7cf98c3f",
     "_sync_hdo_param_groups_to_sub_optimizers": "27cf234b2556a345cab76523a6931ee1f51626117d05482a1230634712cc8226",
@@ -56,7 +63,8 @@ def _validate_native_contract(optimizer_cls: type) -> None:
             actual = _source_fingerprint(getattr(optimizer_cls, name))
         except (AttributeError, OSError, TypeError, SyntaxError) as error:
             raise RuntimeError(f"{_ENV}: cannot inspect native HDO.{name}") from error
-        if actual != expected:
+        accepted = (expected,) if isinstance(expected, str) else expected
+        if actual not in accepted:
             raise RuntimeError(f"{_ENV}: unsupported native HDO.{name} contract ({actual})")
 
 

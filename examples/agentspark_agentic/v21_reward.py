@@ -19,6 +19,7 @@ import importlib.util
 import json
 import math
 import os
+import random
 import re
 import subprocess
 import sys
@@ -254,6 +255,27 @@ def _worker_call(contract: dict[str, Any], operation: str, payload: Any) -> Any:
         "TRANSFORMERS_OFFLINE": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
     }
+    # Preserve only explicit filesystem locations, never inherited policy
+    # flags, credentials or Python import paths.
+    for name in (
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "XDG_CACHE_HOME",
+        "HF_HOME",
+        "HF_HUB_CACHE",
+        "HF_MODULES_CACHE",
+        "HF_DATASETS_CACHE",
+        "TORCH_HOME",
+        "TORCH_EXTENSIONS_DIR",
+        "TORCHINDUCTOR_CACHE_DIR",
+        "TRITON_CACHE_DIR",
+        "CUDA_CACHE_PATH",
+    ):
+        if value := os.environ.get(name):
+            if not Path(value).is_absolute():
+                raise RewardError("reward_worker_path_invalid")
+            env[name] = value
     try:
         result = subprocess.run(
             [sys.executable, "-I", "-B", str(Path(__file__).resolve()), "--worker"],
@@ -437,6 +459,18 @@ def _run_worker(request: dict[str, Any]) -> Any:
     os.environ.update(contract["policy_environment"])
     operation, payload = request["operation"], request["payload"]
     if operation == "reward_view":
+        snapshot = payload["trajectory"]["metadata"].get("agentspark_request")
+        env = config["runtime_env"]
+        if snapshot is not None:
+            expected = {
+                "tools": _strict_json(env["DOTSBRIDGE_AGENTSPARK_TOOLS_JSON"]),
+                "capabilities": _strict_json(env.get("DOTSBRIDGE_AGENTSPARK_CAPABILITIES_JSON", "null")) or {},
+                "skills_name_list": _strict_json(env.get("DOTSBRIDGE_AGENTSPARK_SKILLS_NAME_LIST_JSON", "null")) or [],
+            }
+            if snapshot != expected:
+                raise RewardError("reward_tool_request_config_mismatch")
+        elif env.get("SLIME_AGENTSPARK_SKILL_LOADER_ENABLE") == "1":
+            raise RewardError("reward_loader_request_missing")
         return _source_reward_view(**payload)
     if operation == "build_request":
         return asyncio.run(_source_request(payload))
@@ -556,12 +590,26 @@ def trajectory_from_audit(audit: dict[str, Any], contract: dict[str, Any]) -> di
             "token_provenance": "Native Relax Forest only; reward view has no invented token IDs or logprobs.",
         },
     }
+    snapshot = audit.get("agentspark_request")
+    envelope = metadata.get("agentspark", {})
+    if snapshot is not None:
+        expected = {
+            "tools": envelope.get("tools"),
+            "capabilities": envelope.get("capabilities") or {},
+            "skills_name_list": envelope.get("skills_name_list") or [],
+        }
+        if not isinstance(snapshot, dict) or snapshot != expected:
+            raise RewardError("reward_tool_request_snapshot_mismatch")
+        trajectory["metadata"]["agentspark_request"] = copy.deepcopy(snapshot)
+    elif (envelope.get("capabilities") or {}).get("skill_loader") == "1":
+        raise RewardError("reward_loader_request_missing")
     return _worker_call(
         contract,
         "reward_view",
         {
             "trajectory": trajectory,
             "runtime_prompt": metadata.get("agentspark", {}).get("prompt_spec", {}).get("user_prompt"),
+            "remote_session_sha256": audit.get("remote_session_sha256"),
         },
     )
 
@@ -608,23 +656,42 @@ async def score_audit(
     if owned:
         client = httpx.AsyncClient(trust_env=False, follow_redirects=False)
     try:
-        # No retry re-enters AgentSpark or changes request identity. The Bridge
-        # proxy owns idempotent scoring of this immutable execution identifier.
-        timeout = float(contract["policy_environment"]["SLIME_ASYNC_DOTS_REWARD_TIMEOUT_SEC"])
+        # HTTP retries score the same completed trajectory; they never rerun
+        # AgentSpark or change the source execution/attempt identity.
+        policy = contract["policy_environment"]
+        timeout = float(policy["SLIME_ASYNC_DOTS_REWARD_TIMEOUT_SEC"])
         if not math.isfinite(timeout) or timeout <= 0:
             raise RewardError("reward_timeout_invalid")
-        response = await client.post(reward_base_url.rstrip("/") + "/reward/score", json=request, timeout=timeout)
-        if response.status_code != 200:
-            error_body = None
-            if len(response.content) <= 65536:
-                try:
-                    error_body = _strict_json(response.content)
-                except (ValueError, UnicodeError):
-                    pass
-            raise RewardError(
-                "reward_http_failure",
-                safe_diagnostic=reward_http_diagnostic(error_body, response.status_code),
-            )
+        attempts = int(policy["SLIME_ASYNC_DOTS_REWARD_MAX_ATTEMPTS"])
+        if attempts < 1:
+            raise RewardError("reward_attempts_invalid")
+        for attempt in range(attempts):
+            try:
+                response = await client.post(
+                    reward_base_url.rstrip("/") + "/reward/score", json=request, timeout=timeout
+                )
+            except httpx.TransportError:
+                if attempt + 1 == attempts:
+                    raise
+            else:
+                if response.status_code == 200:
+                    break
+                retryable = response.status_code == 429 or 500 <= response.status_code < 600
+                if not retryable or attempt + 1 == attempts:
+                    error_body = None
+                    if len(response.content) <= 65536:
+                        try:
+                            error_body = _strict_json(response.content)
+                        except (ValueError, UnicodeError):
+                            pass
+                    raise RewardError(
+                        "reward_http_failure",
+                        safe_diagnostic=reward_http_diagnostic(error_body, response.status_code),
+                    )
+            # Bound the exponent as well as the delay. Cancellation propagates
+            # during both transport and backoff; malformed 200s are not retried.
+            delay = min(2 ** min(attempt, 3), 8)
+            await asyncio.sleep(delay + random.uniform(0, delay))
         reply = _strict_json(response.content)
     except (httpx.HTTPError, ValueError, UnicodeError) as exc:
         if isinstance(exc, RewardError):
@@ -641,7 +708,9 @@ async def score_audit(
     return result
 
 
-def _source_reward_view(trajectory: dict[str, Any], runtime_prompt: str | None) -> dict[str, Any]:
+def _source_reward_view(
+    trajectory: dict[str, Any], runtime_prompt: str | None, remote_session_sha256: str | None = None
+) -> dict[str, Any]:
     runtime = trajectory["metadata"]["agentspark_runtime_context"]
     if runtime is not None:
         source_runtime = importlib.import_module(
@@ -697,6 +766,13 @@ def _source_reward_view(trajectory: dict[str, Any], runtime_prompt: str | None) 
         ),
         None,
     )
+    snapshot = trajectory["metadata"]["agentspark_snapshot"]
+    session_id = snapshot.get("session_id") if isinstance(snapshot, dict) else None
+    # Older resident callers omit the digest: keep their snapshot untrusted.
+    if session_id is not None and remote_session_sha256 is not None:
+        if not isinstance(session_id, str) or not session_id or _sha(session_id.encode()) != remote_session_sha256:
+            raise RewardError("reward_snapshot_session_mismatch")
+        trajectory["metadata"]["agentspark_session_id"] = session_id
     return trajectory
 
 

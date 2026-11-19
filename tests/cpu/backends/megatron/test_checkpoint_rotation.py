@@ -256,3 +256,61 @@ def test_checkpoint_async_dpo_rotation_requires_sidecar(save_method, monkeypatch
         if rank == 0:
             expected.append("rotate")
         assert events == expected
+
+
+@pytest.mark.parametrize("rank,fail", [(0, False), (1, False), (0, True)])
+def test_dataset_cursor_commits_before_native_model_tracker(save_method, monkeypatch, rank, fail):
+    from relax.backends.megatron import checkpoint_metadata
+
+    method, namespace = save_method
+    events = []
+
+    def cursor(step):
+        events.append("cursor")
+        assert step == 7
+        if fail:
+            raise OSError("cursor write failed")
+
+    def agree(callback):
+        callback()
+        events.append("agreement")
+
+    monkeypatch.setattr(checkpoint_metadata, "_collective_checkpoint_probe", agree)
+    namespace.update(
+        dist=SimpleNamespace(get_rank=lambda **kw: rank, barrier=lambda **kw: None),
+        get_gloo_group=lambda: object(),
+        ray=SimpleNamespace(get=lambda value: value),
+        save=lambda *a, **kw: events.append("native_save"),
+        rotate_ckpt=lambda *a, **kw: events.append("rotate"),
+    )
+    actor = SimpleNamespace(
+        args=SimpleNamespace(
+            debug_rollout_only=False,
+            offload_train=False,
+            async_save=False,
+            save_hf=None,
+            save_dataset_before_checkpoint=True,
+            colocate=True,
+            fully_async=False,
+            partial_rollout=False,
+            rollout_global_dataset=True,
+            no_save_optim=False,
+            no_save_rng=False,
+        ),
+        model=None,
+        optimizer=None,
+        opt_param_scheduler=None,
+        role="actor",
+        rollout_manager=SimpleNamespace(save=SimpleNamespace(remote=cursor)),
+        _is_standard_dpo=lambda: False,
+        _flush_resident_sft_parameters=lambda: None,
+    )
+    if fail:
+        with pytest.raises(OSError, match="cursor write failed"):
+            method(actor, 7)
+        assert events == ["cursor"]
+    else:
+        method(actor, 7)
+        assert events == (
+            ["cursor", "agreement", "native_save", "rotate"] if rank == 0 else ["agreement", "native_save"]
+        )

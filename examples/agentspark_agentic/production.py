@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from .client import run_audit
+from .client import DEPENDENCY_FAILURE_CODES, run_audit
 from .contexts import analyze_audit
 from .diagnostics import exception_diagnostic, persist_failure, prepare_diagnostics_dir, safe_error_code
 from .media import strict_json_loads
@@ -36,7 +36,8 @@ Scorer = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
 def configure_callback_host(config: AdapterConfig, mapping: dict[str, str]) -> AdapterConfig:
-    """Resolve only an explicit host entry for this node's actual process hostname."""
+    """Resolve only an explicit host entry for this node's actual process
+    hostname."""
     if not isinstance(mapping, dict) or any(
         not isinstance(k, str) or not isinstance(v, str) for k, v in mapping.items()
     ):
@@ -67,7 +68,8 @@ def configure_callback_host(config: AdapterConfig, mapping: dict[str, str]) -> A
 def select_training_exports(
     audit: dict[str, Any], *, compiler_defaults: dict[str, Any], append_roles: tuple[str, ...] = ("tool",)
 ) -> list[dict[str, Any]]:
-    """Export each consecutive segment's terminal context and own each response once.
+    """Export each consecutive segment's terminal context and own each response
+    once.
 
     A native fork can share earlier response nodes. Ownership excludes those
     ancestors in the new segment; the training converter must zero their loss
@@ -131,7 +133,8 @@ def select_training_exports(
 
 
 def attach_reward(records: list[dict[str, Any]], result: dict[str, Any]) -> list[dict[str, Any]]:
-    """Attach one real reward anchor; all contexts carry the scoring evidence."""
+    """Attach one real reward anchor; all contexts carry the scoring
+    evidence."""
     if not isinstance(result, dict) or set(result) != {
         "base_reward",
         "metadata",
@@ -195,7 +198,8 @@ def attach_reward(records: list[dict[str, Any]], result: dict[str, Any]) -> list
 
 
 def publish_training_output(records: list[dict[str, Any]], output_path: str | Path, *, credential: str) -> Path:
-    """Atomically create JSONL without overwriting an existing runtime output."""
+    """Atomically create JSONL without overwriting an existing runtime
+    output."""
     from relax.agentic.runner.ipc import SessionOutput
 
     path = Path(output_path)
@@ -239,7 +243,8 @@ async def run_training(
     allow_dynamic_images: bool = False,
     **execution: Any,
 ) -> dict[str, Any]:
-    """Collect/score once, persist audit, then publish; errors never publish output."""
+    """Collect/score once, persist audit, then publish; errors never publish
+    output."""
     validate_audit_path(audit_path, output_path)
     if Path(output_path).exists() or Path(output_path).is_symlink():
         raise AdapterError("training_output_already_exists")
@@ -259,6 +264,10 @@ async def run_training(
         raise
     phase = "select"
     try:
+        if audit.get("failure_code") in DEPENDENCY_FAILURE_CODES:
+            failure = AdapterError(audit["failure_code"])
+            failure.safe_diagnostic = audit.get("failure_diagnostic", {})
+            raise failure
         records = select_training_exports(audit, compiler_defaults=compiler_defaults, append_roles=append_roles)
         reward_audit = json_copy(audit)
         anchor = next(
@@ -343,6 +352,10 @@ async def _run_cli(
             sampling_temperature=args.sampling_temperature,
             diagnostics_dir=args.diagnostics_dir,
             allow_dynamic_images=args.allow_dynamic_images,
+            # Compatibility argument only: all runners use bounded retries and
+            # deadlines. Upgraded runners propagate dependency exit 75; older
+            # resident runners use exit 2 and may drop this unsuccessful Group.
+            hold_on_replay_exhaustion=not args.dependency_exit_supported,
         )
     finally:
         for sig in installed:
@@ -365,6 +378,7 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] | None = None)
     parser.add_argument("--allow-dynamic-images", action="store_true", help="enable bounded callback image admission")
     args = parser.parse_args(argv)
     environment = os.environ if env is None else env
+    args.dependency_exit_supported = environment.get("RELAX_AGENT_DEPENDENCY_EXIT_SUPPORTED") == "1"
     context = None
     session_input = None
     try:
@@ -374,18 +388,22 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] | None = None)
         input_path, args.output_path = environment.get("RELAX_INPUT_JSON"), environment.get("RELAX_OUTPUT_JSON")
         if not input_path or not args.output_path or Path(input_path).resolve() == Path(args.output_path).resolve():
             raise AdapterError("training_input_output_paths_invalid")
-        config = AdapterConfig.from_payload(strict_json_loads(Path(args.config).read_bytes()))
+        config = AdapterConfig.from_file(args.config)
         if args.callback_host_map:
             config = configure_callback_host(config, strict_json_loads(Path(args.callback_host_map).read_bytes()))
         session_input = strict_json_loads(Path(input_path).read_bytes())
         asyncio.run(_run_cli(config, context, session_input, args))
     except (Exception, KeyboardInterrupt) as exc:
         persist_failure(
-            args.diagnostics_dir, exc, context=context,
+            args.diagnostics_dir,
+            exc,
+            context=context,
             audit={"source_input": session_input} if session_input is not None else None,
         )
         code = safe_error_code(exc, "training_agent_failed")
         sys.stderr.write(f"AgentSpark training agent failed: {code}\n")
+        if code in DEPENDENCY_FAILURE_CODES and args.dependency_exit_supported:
+            return 75
         return 2
     return 0
 

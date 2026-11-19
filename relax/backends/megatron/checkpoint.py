@@ -661,6 +661,16 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     )
     state = _collective_checkpoint_probe(lambda: _checkpoint_load_state(load_path, args, load_optimizer))
     exist = state["exists"]
+    strict_resume = bool(getattr(args, "strict_checkpoint_resume", False)) and optimizer is not None
+    resume_metadata = None
+    if strict_resume:
+        if not state["megatron"] or not state["valid_iteration"] or not state["has_optimizer"]:
+            raise RuntimeError("Strict resume requires an existing full native checkpoint; HF fallback is disabled")
+        from relax.backends.megatron.checkpoint_metadata import _validate_strict_resume_metadata
+
+        resume_metadata = _collective_checkpoint_probe(
+            lambda: _validate_strict_resume_metadata(args, Path(state["iteration_dir"]))
+        )
 
     if state["megatron"]:
         current_is_rm = is_rm_mode(args) and getattr(ddp_model[0], "role", "actor") == "actor"
@@ -708,13 +718,27 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                     else nullcontext()
                 )
                 with step_context:
-                    return _load_checkpoint_megatron(
+                    result = _load_checkpoint_megatron(
                         ddp_model=ddp_model,
                         optimizer=optimizer,
                         opt_param_scheduler=opt_param_scheduler,
                         checkpointing_context=checkpointing_context,
                         skip_load_to_model_and_opt=skip_load_to_model_and_opt,
                     )
+                    if strict_resume:
+
+                        def validate_restored_progress():
+                            if result[0] != resume_metadata["iteration"]:
+                                raise RuntimeError("Strict resume restored a different iteration")
+                            if (
+                                opt_param_scheduler.state_dict().get("num_steps")
+                                != resume_metadata["scheduler_num_steps"]
+                            ):
+                                raise RuntimeError("Strict resume optimizer scheduler was reset")
+                            return result[0]
+
+                        _collective_checkpoint_probe(validate_restored_progress)
+                    return result
 
             _validate_lora_checkpoint_metadata(args, ddp_model, lora_metadata)
             if not skip_load_to_model_and_opt:

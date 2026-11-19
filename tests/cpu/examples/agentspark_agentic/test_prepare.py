@@ -1,4 +1,5 @@
-"""Offline source conversion regressions; no inference, network, or GPU calls."""
+"""Offline source conversion regressions; no inference, network, or GPU
+calls."""
 
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from examples.agentspark_agentic.prepare import (
     prepare_jsonl,
     strict_json,
 )
+from examples.agentspark_agentic.protocol import AdapterError
 
 
 USER_TEMPLATE = (
@@ -126,7 +128,7 @@ def test_source_profile_is_explicit_and_only_whitelisted_identity_is_retained(tm
     [
         ("tools", "source_tools_mismatch"),
         ("runtime", "source_runtime_policy_missing"),
-        ("loader", "source_skill_loader_not_supported"),
+        ("loader", "source_skill_loader_capabilities_mismatch"),
         ("slot", "source_query_slot_invalid"),
     ],
 )
@@ -504,8 +506,67 @@ def test_registry_image_references_and_avatar_do_not_trigger_offline_pixel_downl
     assert result["metadata"]["agentspark_media"]["assets"] == []
     assert result["metadata"]["resource_registry"] == row["metadata"]["resource_registry"]
     assert result["metadata"]["agentspark_prepare"]["remote_registry_urls_are_references_not_verified_pixels"] is True
-    row["metadata"]["resource_registry"]["resources"]["N1"]["image"][0][
-        "url"
-    ] = "https://not-allowed.example.test/image.jpg"
+    row["metadata"]["resource_registry"]["resources"]["N1"]["image"][0]["url"] = (
+        "https://not-allowed.example.test/image.jpg"
+    )
     with pytest.raises(PreparationError, match="^miles_source_compilation_failed$"):
         converter.convert(row, source_line=1)
+
+
+def _loader_profile(paths):
+    config = json.loads(paths[0].read_text())
+    tools = ["search_request", "load_tools", "load_skills"]
+    (paths[1] / "tools.json").write_text(json.dumps(tools))
+    (paths[1] / "system_prompt.md").write_text("<AvailableSkills>subscription</AvailableSkills>")
+    config["runtime_env"].update(
+        {
+            "SLIME_AGENTSPARK_SKILL_LOADER_ENABLE": "1",
+            "DOTSBRIDGE_AGENTSPARK_TOOLS_JSON": json.dumps(tools),
+            "DOTSBRIDGE_AGENTSPARK_CAPABILITIES_JSON": '{"skill_loader":"1"}',
+            "DOTSBRIDGE_AGENTSPARK_SKILLS_NAME_LIST_JSON": '["subscription"]',
+        }
+    )
+    paths[0].write_text(json.dumps(config))
+    return config
+
+
+@pytest.mark.parametrize(
+    "change,code",
+    [
+        ("catalog", "loader_catalog_incomplete"),
+        ("flag", "source_skill_loader_capabilities_mismatch"),
+        ("tool", "source_skill_loader_catalog_missing"),
+    ],
+)
+def test_loader_profile_rejects_inconsistent_capability_contract(tmp_path, change, code):
+    paths = _write_profile(tmp_path)
+    config = _loader_profile(paths)
+    if change == "catalog":
+        (paths[1] / "system_prompt.md").write_text("<AvailableSkills>different</AvailableSkills>")
+    elif change == "flag":
+        config["runtime_env"]["SLIME_AGENTSPARK_SKILL_LOADER_ENABLE"] = "0"
+    else:
+        tools = ["search_request"]
+        config["runtime_env"]["DOTSBRIDGE_AGENTSPARK_TOOLS_JSON"] = json.dumps(tools)
+        (paths[1] / "tools.json").write_text(json.dumps(tools))
+    paths[0].write_text(json.dumps(config))
+    with pytest.raises(AdapterError, match=code):
+        _config(paths)
+
+
+def test_loader_compiler_preserves_request_catalog_and_profile_identity(tmp_path):
+    source = os.environ.get("MILES_SOURCE_DIR")
+    if not source:
+        pytest.skip("Explicit frozen Miles input compiler is required")
+    paths = _write_profile(tmp_path, source=Path(source))
+    _loader_profile(paths)
+    config = _config(paths)
+    converter = MilesPreparedConverter(config, allowed_roots=[tmp_path])
+    with converter.source():
+        row = converter.convert(_row(), source_line=1)
+    envelope = row["metadata"]["agentspark"]
+    assert envelope["capabilities"] == {"skill_loader": "1"}
+    assert envelope["skills_name_list"] == ["subscription"]
+    assert config.identity["skill_loader_enabled"]
+    assert row["metadata"]["agentspark_prepare"]["profile_sha256"] == config.identity["profile_sha256"]
+    assert envelope["prompt_spec"]["system_prompt"] == config.system_prompt

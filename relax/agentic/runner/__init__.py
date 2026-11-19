@@ -3,6 +3,7 @@
 """External-agent process boundary."""
 
 from relax.agentic.runner.ipc import (
+    AgentDependencyError,
     AgentExecutionError,
     ManagedAgentLauncher,
     ManagedAgentProcess,
@@ -14,6 +15,7 @@ from relax.agentic.runner.ipc import (
 
 
 __all__ = [
+    "AgentDependencyError",
     "AgentExecutionError",
     "ManagedAgentProcess",
     "ManagedAgentLauncher",

@@ -269,3 +269,69 @@ class TestDataSourceIntegration:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_atomic_dataset_failure_preserves_previous_cursor(tmp_path, monkeypatch):
+    import torch
+
+    from relax.utils.checkpoint_resume import atomic_save_dataset_state
+
+    path = tmp_path / "cursor.pt"
+    atomic_save_dataset_state({"sample_offset": 3}, str(path))
+
+    def fail(state, stream):
+        stream.write(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(torch, "save", fail)
+    with pytest.raises(OSError, match="disk full"):
+        atomic_save_dataset_state({"sample_offset": 9}, str(path))
+    assert torch.load(path, weights_only=False) == {"sample_offset": 3}
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.parametrize("failure", [None, "missing", "corrupt", "wrong_step", "counter"])
+def test_strict_dataset_resume_never_restarts_cursor(data_source_module, tmp_path, failure):
+    from relax.utils.checkpoint_resume import atomic_save_dataset_state, dataset_identity
+
+    prompt = tmp_path / "prompts.jsonl"
+    prompt.write_text('{"text":"synthetic"}\n')
+    args = Namespace(
+        rollout_global_dataset=True,
+        load=str(tmp_path),
+        strict_checkpoint_resume=True,
+        prompt_data=str(prompt),
+        n_samples_per_prompt=2,
+        rollout_seed=42,
+        rollout_shuffle=False,
+    )
+    state = {
+        "sample_offset": 1,
+        "epoch_id": 0,
+        "sample_group_index": 1,
+        "sample_index": 2,
+        "metadata": {},
+        "use_streaming": False,
+        "resume_contract": {"version": 1, "rollout_id": 7, "dataset_size": 1, **dataset_identity(args)},
+    }
+    path = tmp_path / "dataset/global_dataset_state_dict_7.pt"
+    if failure == "wrong_step":
+        state["resume_contract"]["rollout_id"] = 8
+    if failure == "counter":
+        state["sample_index"] = 0
+    if failure != "missing":
+        atomic_save_dataset_state(state, str(path))
+    if failure == "corrupt":
+        path.write_bytes(b"broken")
+    source = data_source_module.RolloutDataSource.__new__(data_source_module.RolloutDataSource)
+    source.args = args
+    source.dataset = [object()]
+    source._use_streaming = False
+    source.sample_offset = 99
+    if failure:
+        with pytest.raises(Exception):
+            source.load(7)
+        assert source.sample_offset == 99
+    else:
+        source.load(7)
+        assert source.sample_offset == 1 and source.sample_index == 2

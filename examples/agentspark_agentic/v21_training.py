@@ -15,6 +15,10 @@ from typing import Any
 
 from examples.agentspark_agentic.k3_token_credit import attach_k3_followup_mask
 from examples.agentspark_agentic.v21_loss import DEFAULTS, FIELDS, MAIN_DEFAULTS, validate
+from relax.utils.logging_utils import get_logger
+
+
+logger = get_logger(__name__)
 
 
 class CreditError(ValueError):
@@ -187,6 +191,11 @@ def training_overrides(contract: dict) -> dict:
 
     root, config = _verify_contract(contract)
     train = config["train"]
+    if (
+        config["runtime_env"].get("SLIME_AGENTSPARK_SKILL_LOADER_ENABLE") == "1"
+        and train.get("loss-type") == "score_centering"
+    ):
+        raise CreditError("v21_loader_score_centering_unsupported")
     options = {name: train.get(name.replace("_", "-"), default) for name, default in DEFAULTS.items()}
     options["followup_token_credit"] = train["followup-token-credit"]
     identity = {name: contract[name] for name in ("source_layout", "source_config_sha256", "source_files_sha256")}
@@ -201,6 +210,11 @@ def training_overrides(contract: dict) -> dict:
         "miles/backends/training_utils/loss_hub/math_utils.py",
     )
     hashes = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in math_files}
+    sc_options = {}
+    if train.get("loss-type") == "score_centering":
+        from examples.agentspark_agentic.v21_score_centering_loss import training_overrides as sc_overrides
+
+        sc_options = sc_overrides(config)
     return {
         **options,
         **main,
@@ -208,6 +222,7 @@ def training_overrides(contract: dict) -> dict:
         "agentspark_v21_loss_options": dict(options),
         "agentspark_v21_main_options": main,
         "agentspark_v21_math_source_files": hashes,
+        **sc_options,
     }
 
 
@@ -331,4 +346,24 @@ def convert_samples(args: Any, samples: list[Any]):
     native_args.debug_train_only = True
     data = convert_samples_to_train_data(native_args, prepared)
     data.update(convert_credit(prepared))
+    ctr_rows = [
+        (sample, mask, scalar)
+        for sample, mask, scalar, clarification in zip(
+            prepared,
+            data["followup_token_masks"],
+            data["followup_token_advantage_scalars"],
+            data["followup_clarification_credit_flags"],
+            strict=True,
+        )
+        if not clarification and scalar != 0 and any(mask)
+    ]
+    logger.info(
+        "V21 CTR batch: logical_samples=%d eligible=%d active=%d active_tokens=%d positive=%d negative=%d",
+        len({sample.index for sample in prepared}),
+        len({sample.index for sample in prepared if sample.metadata.get("quality_first_ctr_eligible")}),
+        len({sample.index for sample, _, _ in ctr_rows}),
+        sum(sum(mask) for _, mask, _ in ctr_rows),
+        len({sample.index for sample, _, scalar in ctr_rows if scalar > 0}),
+        len({sample.index for sample, _, scalar in ctr_rows if scalar < 0}),
+    )
     return data if args.debug_train_only else dict_to_tensordict(data, len(prepared))

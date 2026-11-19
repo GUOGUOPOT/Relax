@@ -13,6 +13,7 @@ import torch
 
 from relax.backends.megatron import bounded_cpu_optimizer as module
 
+
 hybrid_module = pytest.importorskip("megatron.core.optimizer.cpu_offloading.hybrid_optimizer")
 HybridDeviceOptimizer = hybrid_module.HybridDeviceOptimizer
 
@@ -273,3 +274,9 @@ def test_bounded_unknown_native_contract_and_unsupported_modes_fail_closed(monke
     hdo.cpu_optimizers[0].param_groups[0]["fused"] = False
     with pytest.raises(RuntimeError, match="fused CPU AdamW"):
         module._validate_children(hdo)
+
+
+def test_bounded_rejects_unknown_copy_back_hook(monkeypatch) -> None:
+    monkeypatch.setattr(HybridDeviceOptimizer, "_register_param_copy_back_gpu_hook", _step)
+    with pytest.raises(RuntimeError, match="native HDO._register_param_copy_back_gpu_hook"):
+        module._validate_native_contract(HybridDeviceOptimizer)

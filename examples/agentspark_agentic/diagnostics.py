@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Allowlisted failure metadata; no messages, URLs, paths, credentials, or media."""
+"""Allowlisted failure metadata; no messages, URLs, paths, credentials, or
+media."""
 
 from __future__ import annotations
 
@@ -16,11 +17,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .error_observation import sanitize_error_observation
 from .protocol import AdapterError
 
 
 # Explicit codes owned by this adapter. Unknown additions stay generic until reviewed.
-_SAFE_LOCAL_CODES = frozenset("""
+_SAFE_LOCAL_CODES = frozenset(
+    """
 agentspark_envelope_fields_invalid agentspark_envelope_version_invalid agentspark_http_error
 agentspark_stream_end_missing agentspark_stream_error agentspark_transport_error attachment_input_invalid
 audit_cancelled audit_credential_field_forbidden audit_execution_failed audit_failed audit_lifecycle_failed
@@ -51,7 +54,8 @@ explicit_system_and_user_prompt_required history_concurrent_callback_unsupported
 history_prefix_changed history_tool_calls_ambiguous history_tool_calls_invalid
 history_tool_calls_semantic_mismatch history_tool_result_name_mismatch history_tool_result_unmapped
 image_input_invalid input_item_invalid input_type_unsupported inputs_invalid invalid_sse_utf8
-loader_catalog_incomplete loader_catalog_required media_allowed_roots_invalid media_allowed_roots_required
+loader_catalog_incomplete loader_catalog_required reward_loader_request_missing
+reward_tool_request_config_mismatch reward_tool_request_snapshot_mismatch media_allowed_roots_invalid media_allowed_roots_required
 media_asset_identity_changed media_asset_invalid media_assistant_image_response_forbidden
 media_binding_invalid media_candidate_stale_or_unrelated media_concurrent_callback_unsupported
 media_content_invalid media_content_part_unsupported media_dynamic_image_block_invalid
@@ -73,7 +77,13 @@ production_scoring_or_selection_failed production_template_kwargs_invalid
 production_thinking_control_invalid production_unconfigured_template_kwargs
 relax_input_and_output_paths_required replay_ack_session_inconsistent replay_ack_session_missing
 replay_attributes_invalid replay_attributes_required replay_eof_without_ack replay_error_event
-replay_invalid_ack replay_messages_invalid replay_spec_invalid replay_spec_required replay_unexpected_event
+replay_invalid_ack replay_messages_invalid replay_retry_exhausted replay_spec_invalid replay_spec_required
+replay_temporarily_unavailable replay_attempt_timeout replay_unexpected_event
+endpoint_pin_invalid agentspark_dependency_unavailable config_replay_max_attempts_invalid
+config_replay_initial_backoff_s_invalid config_replay_max_backoff_s_invalid
+config_replay_attempt_timeout_s_invalid config_replay_backoff_invalid
+config_prepare_start_spread_s_invalid config_session_lookup_timeout_s_invalid config_first_callback_timeout_s_invalid
+session_lookup_timeout first_callback_timeout
 reward_already_postprocessed reward_audit_incomplete reward_callback_invalid reward_contract_invalid
 reward_critic_execution_failed reward_digest_invalid reward_duplicate_json_key reward_endpoint_invalid
 reward_fingerprint_invalid reward_followup_mask_invalid reward_formal_objective_mismatch
@@ -97,29 +107,84 @@ training_append_roles_invalid training_cancelled training_exports_empty
 training_generation_identity_ambiguous training_input_output_paths_invalid training_output_already_exists
 training_reward_anchor_invalid training_reward_evidence_missing training_reward_identity_mismatch
 training_reward_nonfinite training_reward_result_invalid
-""".split())
-_SAFE_TYPES = frozenset({
-    "invalid_request_error", "authentication_error", "permission_error", "not_found_error",
-    "rate_limit_error", "internal_error", "server_error", "api_error", "timeout_error",
-    "client_disconnect", "BadRequestError", "InternalServerError", "TimeoutError",
-    "ValueError", "RuntimeError",
-})
-_SAFE_REMOTE_CODES = _SAFE_TYPES | frozenset({
-    "context_length_exceeded", "session_discarded", "invalid_request", "request_timeout",
-    "rate_limit_exceeded", "no_available_workers", "model_not_found", "tool_execution_error",
-    "agent_execution_error", "connection_error", "cancelled", "reward_invalid",
-})
+""".split()
+)
+_SAFE_TYPES = frozenset(
+    {
+        "invalid_request_error",
+        "authentication_error",
+        "permission_error",
+        "not_found_error",
+        "rate_limit_error",
+        "internal_error",
+        "server_error",
+        "api_error",
+        "timeout_error",
+        "client_disconnect",
+        "BadRequestError",
+        "InternalServerError",
+        "TimeoutError",
+        "ValueError",
+        "RuntimeError",
+    }
+)
+_SAFE_REMOTE_CODES = _SAFE_TYPES | frozenset(
+    {
+        "context_length_exceeded",
+        "session_discarded",
+        "invalid_request",
+        "request_timeout",
+        "rate_limit_exceeded",
+        "no_available_workers",
+        "model_not_found",
+        "tool_execution_error",
+        "agent_execution_error",
+        "connection_error",
+        "cancelled",
+        "reward_invalid",
+    }
+)
 _REWARD_SIGNATURES = {
     "issue impacts must cover every verified root exactly once": "judge_issue_impact_coverage_invalid",
     "judge JSON/schema validation failed": "judge_schema_validation_failed",
     "no_available_workers": "no_available_workers",
 }
-_EXCEPTION_TYPES = frozenset({
-    "AdapterError", "RewardError", "UpstreamDiagnosticError", "CancelledError", "KeyboardInterrupt",
-    "ConnectError", "ConnectTimeout", "ReadError", "ReadTimeout", "WriteError", "WriteTimeout",
-    "PoolTimeout", "RemoteProtocolError", "HTTPStatusError", "TimeoutError", "ValueError",
-    "TypeError", "OSError", "FileNotFoundError", "PermissionError", "RuntimeError",
-})
+_SSE_RATE_LIMITER_MESSAGE = "Eden SSE rate limiter unavailable: total"
+_SSE_RATE_LIMITER_REASON = "eden_sse_rate_limiter_unavailable"
+_SSE_ADMISSION_REJECTIONS = {
+    _SSE_RATE_LIMITER_MESSAGE: _SSE_RATE_LIMITER_REASON,
+    "Eden SSE rate limit exceeded: total": "eden_sse_rate_limit_exceeded_total",
+    "Eden SSE rate limit exceeded: source": "eden_sse_rate_limit_exceeded_source",
+}
+SSE_ADMISSION_REJECTION_REASONS = frozenset(_SSE_ADMISSION_REJECTIONS.values())
+_SAFE_REASON_CODES = frozenset(_REWARD_SIGNATURES.values()) | SSE_ADMISSION_REJECTION_REASONS
+_UPSTREAM_PHASES = frozenset({"replay", "send", "session_lookup"})
+_EXCEPTION_TYPES = frozenset(
+    {
+        "AdapterError",
+        "ReplayUnavailableError",
+        "RewardError",
+        "UpstreamDiagnosticError",
+        "CancelledError",
+        "KeyboardInterrupt",
+        "ConnectError",
+        "ConnectTimeout",
+        "ReadError",
+        "ReadTimeout",
+        "WriteError",
+        "WriteTimeout",
+        "PoolTimeout",
+        "RemoteProtocolError",
+        "HTTPStatusError",
+        "TimeoutError",
+        "ValueError",
+        "TypeError",
+        "OSError",
+        "FileNotFoundError",
+        "PermissionError",
+        "RuntimeError",
+    }
+)
 _STAGES = frozenset({"prepare", "collect", "select", "score", "attach", "publish", "cli"})
 
 
@@ -136,8 +201,21 @@ def _status(value: Any) -> bool:
     return type(value) is int and 100 <= value <= 599
 
 
+def sse_rate_limiter_unavailable(payload: Any) -> bool:
+    """Recognize the observed admission rejection, not arbitrary overload-like
+    text."""
+    return isinstance(payload, dict) and payload.get("message") == _SSE_RATE_LIMITER_MESSAGE
+
+
+def sse_admission_rejection_reason(payload: Any) -> str | None:
+    """Match only the three observed, exact admission refusal messages."""
+    message = payload.get("message") if isinstance(payload, dict) else None
+    return _SSE_ADMISSION_REJECTIONS.get(message) if isinstance(message, str) else None
+
+
 def upstream_diagnostic(payload: Any, *, http_status: int | None = None) -> dict[str, Any]:
-    """Inspect only known envelope keys; never retain arbitrary strings or recurse into content."""
+    """Inspect only known envelope keys; never retain arbitrary strings or
+    recurse into content."""
     output: dict[str, Any] = {}
     pending = [payload]
     for _ in range(3):
@@ -155,8 +233,15 @@ def upstream_diagnostic(payload: Any, *, http_status: int | None = None) -> dict
             for key in ("status", "status_code", "_http_status"):
                 if _status(item.get(key)):
                     output.setdefault("status", item[key])
-            if item.get("reason_code") in _REWARD_SIGNATURES.values():
-                output.setdefault("reason_code", item["reason_code"])
+            reason = item.get("reason_code")
+            if isinstance(reason, str) and reason in _SAFE_REASON_CODES:
+                output.setdefault("reason_code", reason)
+            admission_reason = sse_admission_rejection_reason(item)
+            if admission_reason is not None:
+                output.setdefault("reason_code", admission_reason)
+            phase = item.get("phase")
+            if isinstance(phase, str) and phase in _UPSTREAM_PHASES:
+                output.setdefault("phase", phase)
             if _status(item.get("http_status")):
                 output.setdefault("http_status", item["http_status"])
             children.extend(item.get(key) for key in ("error", "data", "detail") if isinstance(item.get(key), dict))
@@ -167,7 +252,8 @@ def upstream_diagnostic(payload: Any, *, http_status: int | None = None) -> dict
 
 
 def reward_http_diagnostic(payload: Any, http_status: int) -> dict[str, Any]:
-    """Map known proxy failure signatures to constants, without copying the proxy's detail text."""
+    """Map known proxy failure signatures to constants, without copying the
+    proxy's detail text."""
     output = upstream_diagnostic(payload, http_status=http_status)
     detail = payload.get("detail") if isinstance(payload, dict) else None
     if isinstance(detail, str):
@@ -232,11 +318,48 @@ def failure_summary(
     errors = errors if isinstance(errors, list) else []
     result["callback_errors"] = [x for x in errors if isinstance(x, str) and x in _SAFE_LOCAL_CODES][-16:]
     upstream = []
+    failure_diagnostic = upstream_diagnostic(audit.get("failure_diagnostic"))
+    failure_phase = audit.get("failure_phase", failure_diagnostic.get("phase"))
+    if isinstance(failure_phase, str) and failure_phase in _UPSTREAM_PHASES:
+        failure_diagnostic["phase"] = failure_phase
+        if failure_diagnostic:
+            upstream.append({"origin": f"agentspark_{failure_phase}", **failure_diagnostic})
+    endpoint = audit.get("endpoint_sha256")
+    if isinstance(endpoint, str) and re.fullmatch(r"[0-9a-f]{64}", endpoint):
+        result["endpoint_sha256"] = endpoint
+    attempts = audit.get("replay_attempts")
+    if type(attempts) is int and attempts > 0:
+        result["replay_attempts"] = attempts
+    observations = audit.get("upstream_observations")
+    if isinstance(observations, list):
+        safe_observations = []
+        for observation in observations[-4:]:
+            if not isinstance(observation, dict):
+                continue
+            detail = sanitize_error_observation(observation.get("detail"))
+            if not detail:
+                continue
+            entry = {"detail": detail}
+            for key in ("request_started_unix_ms", "error_unix_ms", "elapsed_ms", "frames_before_error"):
+                value = observation.get(key)
+                if type(value) is int and 0 <= value < 2**63:
+                    entry[key] = value
+            if _status(observation.get("transport_http_status")):
+                entry["transport_http_status"] = observation["transport_http_status"]
+            event_digest = observation.get("event_raw_sha256")
+            if isinstance(event_digest, str) and re.fullmatch(r"[0-9a-f]{64}", event_digest):
+                entry["event_raw_sha256"] = event_digest
+            safe_observations.append(entry)
+        if safe_observations:
+            result["upstream_observations"] = safe_observations
     diagnostics = callbacks.get("diagnostics")
     diagnostics = diagnostics if isinstance(diagnostics, list) else []
     for item in diagnostics[-16:]:
         if isinstance(item, dict):
-            record = {"origin": "callback", **upstream_diagnostic(item.get("upstream"), http_status=item.get("http_status"))}
+            record = {
+                "origin": "callback",
+                **upstream_diagnostic(item.get("upstream"), http_status=item.get("http_status")),
+            }
             code = item.get("code")
             if isinstance(code, str) and code in _SAFE_LOCAL_CODES:
                 record["adapter_code"] = code
@@ -269,8 +392,12 @@ def prepare_diagnostics_dir(directory: str | Path) -> Path:
 
 
 def persist_failure(
-    directory: str | Path | None, exc: BaseException, *, context: Any = None,
-    audit: dict[str, Any] | None = None, stage: str = "cli",
+    directory: str | Path | None,
+    exc: BaseException,
+    *,
+    context: Any = None,
+    audit: dict[str, Any] | None = None,
+    stage: str = "cli",
 ) -> Path | None:
     if directory is None or getattr(exc, "_agentspark_diagnostic_attempted", False):
         return None

@@ -1,6 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Standalone Stage 2 protocol audit. Success exits 3: training is not ready."""
+"""Standalone Stage 2 protocol audit.
+
+Success exits 3: training is not ready.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import os
+import random
 import signal
 import sys
 from collections.abc import Awaitable, Callable, Mapping
@@ -18,17 +22,101 @@ from typing import Any
 import httpx
 
 from .callback import CallbackRecorder
-from .diagnostics import persist_failure, prepare_diagnostics_dir, safe_error_code, upstream_diagnostic
+from .diagnostics import (
+    SSE_ADMISSION_REJECTION_REASONS,
+    exception_diagnostic,
+    persist_failure,
+    prepare_diagnostics_dir,
+    safe_error_code,
+    upstream_diagnostic,
+)
 from .media import ASSET_PREFIX, MediaPlan
 from .protocol import AdapterConfig, AdapterError, RelaxContext, json_copy, prepare_envelope, replay_body, send_body
 from .result import PENDING_GATES, reject_credentials, validate_audit_path, write_audit
-from .transport import AgentSparkClient
+from .transport import AgentSparkClient, ReplayUnavailableError
 
 
 # A deployment owner may inject an already verified cleanup operation. There is
 # deliberately no guessed HTTP cancellation endpoint or dynamic import in CLI.
 CleanupHook = Callable[[dict[str, str]], Awaitable[None]]
 AUDIT_ONLY_EXIT = 3
+DEPENDENCY_FAILURE_CODES = frozenset(
+    {
+        "replay_retry_exhausted",
+        "replay_attempt_timeout",
+        "agentspark_dependency_unavailable",
+        "session_lookup_timeout",
+        "first_callback_timeout",
+    }
+)
+
+
+async def _restore_with_retry(
+    remote: AgentSparkClient,
+    body: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    hold_on_replay_exhaustion: bool,
+) -> str:
+    """Retry only proven pre-ack rejections, retaining this invocation and
+    input.
+
+    The legacy compatibility argument never disables the attempt bound.
+    """
+    from relax.utils.logging_utils import get_logger
+
+    config = remote.config
+    backoff = config.replay_initial_backoff_s
+    while True:
+        report["replay_attempts"] += 1
+        try:
+            return await asyncio.wait_for(remote.restore(body), timeout=config.replay_attempt_timeout_s)
+        except ReplayUnavailableError as exc:
+            exhausted = report["replay_attempts"] >= config.replay_max_attempts
+            if exhausted:
+                failure = AdapterError("replay_retry_exhausted")
+                failure.safe_diagnostic = exc.safe_diagnostic
+                raise failure from exc
+            delay = min(config.replay_max_backoff_s, backoff * random.uniform(0.75, 1.25))
+            get_logger(__name__).warning(
+                "AgentSpark replay dependency unavailable: attempt=%d delay_s=%.2f "
+                "retaining_original_session=true endpoint_sha256=%s",
+                report["replay_attempts"],
+                delay,
+                report["endpoint_sha256"],
+            )
+            report["replay_backoff_s"] += delay
+            # This coroutine is owned by run_with_stop: SIGTERM and cancellation
+            # interrupt both the request and the bounded backoff.
+            await asyncio.sleep(delay)
+            backoff = min(config.replay_max_backoff_s, backoff * 2)
+        except asyncio.TimeoutError as exc:
+            # An ambiguous POST outcome must never trigger automatic resubmission.
+            raise AdapterError("replay_attempt_timeout") from exc
+
+
+async def _send_until_first_callback(
+    operation: Awaitable[None], first_callback: asyncio.Event, timeout_s: float
+) -> None:
+    """Bound preparation only; a validated callback disables the deadline."""
+    work = asyncio.create_task(operation)
+    started = asyncio.create_task(first_callback.wait())
+    try:
+        done, _ = await asyncio.wait({work, started}, timeout=timeout_s, return_when=asyncio.FIRST_COMPLETED)
+        if work in done:
+            await work
+        elif first_callback.is_set():
+            # No timeout on model generation, group barrier, or later tool turns.
+            await work
+        else:
+            # Closing the local stream does not prove the remote operation stopped.
+            # This ambiguous Send is never submitted again.
+            raise AdapterError("first_callback_timeout")
+    finally:
+        for task in (work, started):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(work, started, return_exceptions=True)
 
 
 async def run_audit(
@@ -44,19 +132,23 @@ async def run_audit(
     pinned_template_kwargs: dict[str, Any] | None = None,
     pinned_temperature: float | None = None,
     allow_dynamic_images: bool = False,
+    hold_on_replay_exhaustion: bool = False,
 ) -> dict[str, Any]:
-    """Run one prepared request, drain callbacks/SSE, and return non-training evidence.
+    """Run one prepared request, drain callbacks/SSE, and return non-training
+    evidence.
 
     The entire group must be admitted remotely before its first callback can
-    clear Relax's group barrier. This single-invocation adapter cannot establish
-    remote group capacity, so it cannot by itself make a deployment ready.
+    clear Relax's group barrier. This single-invocation adapter cannot
+    establish remote group capacity, so it cannot by itself make a deployment
+    ready.
     """
     envelope = prepare_envelope(session_input)
     reject_credentials(session_input, context.session_id)
     private_media = session_input.get("metadata", {}).get("agentspark_media")
     media = (
         MediaPlan(private_media, config.media_allowed_roots, allow_dynamic_images=allow_dynamic_images)
-        if private_media is not None else None
+        if private_media is not None
+        else None
     )
     if allow_dynamic_images and media is None:
         raise AdapterError("media_plan_required")
@@ -78,6 +170,10 @@ async def run_audit(
         "remote_execution": "not_started",
         "send_attempts": 0,
         "replay_attempted": False,
+        "replay_attempts": 0,
+        "replay_backoff_s": 0.0,
+        "prepare_start_delay_s": 0.0,
+        "endpoint_sha256": hashlib.sha256(config.base_url.encode()).hexdigest(),
         "stream": {"events": [], "saw_end": False, "saw_error": False, "eof": False},
         "callbacks": {"records": [], "errors": []},
         "cleanup": {
@@ -103,19 +199,49 @@ async def run_audit(
 
     async def execute(remote: AgentSparkClient) -> None:
         nonlocal remote_session
+        if config.prepare_start_spread_s:
+            # Spread once before occupying a remote Session or SSE slot.
+            delay = random.uniform(0.0, config.prepare_start_spread_s)
+            report["prepare_start_delay_s"] = delay
+            await asyncio.sleep(delay)
         wire_envelope = media.wire_envelope(envelope) if media is not None else envelope
         if wire_envelope.get("replay_spec") is not None:
             report["replay_attempted"] = True
             report["remote_execution"] = "unknown"
-            remote_session = await remote.restore(replay_body(config, context, wire_envelope))
+            report["failure_phase"] = "replay"
+            remote_session = await _restore_with_retry(
+                remote,
+                replay_body(config, context, wire_envelope),
+                report,
+                hold_on_replay_exhaustion=hold_on_replay_exhaustion,
+            )
             report["session_source"] = "replay_ack"
         else:
-            remote_session = await remote.get_session(context)
+            report["failure_phase"] = "session_lookup"
+            report["remote_execution"] = "unknown"
+            try:
+                remote_session = await asyncio.wait_for(
+                    remote.get_session(context), timeout=config.session_lookup_timeout_s
+                )
+            except asyncio.TimeoutError as exc:
+                raise AdapterError("session_lookup_timeout") from exc
             report["session_source"] = "get_session"
         report["remote_session_sha256"] = hashlib.sha256(remote_session.encode()).hexdigest()
         body = send_body(config, context, wire_envelope, remote_session, recorder.public_base_url)
+        # Capture the actual Send catalog, excluding session identifiers and credentials.
+        report["agentspark_request"] = {
+            "tools": json_copy(body["tools"]),
+            "capabilities": json_copy(body.get("capabilities") or {}),
+            "skills_name_list": json_copy(body.get("skills_name_list") or []),
+        }
         report["send_attempts"] = 1
+        report["failure_phase"] = "send"
         report["remote_execution"] = "unknown"
+        await _send_until_first_callback(
+            send_and_drain(remote, body), recorder.first_callback_started, config.first_callback_timeout_s
+        )
+
+    async def send_and_drain(remote: AgentSparkClient, body: dict[str, Any]) -> None:
         event_capture_failure = None
         async for event in remote.events(body):
             # Preserve business snapshots for later scoring/resource validation.
@@ -147,6 +273,18 @@ async def run_audit(
         report["stream"]["eof"] = True
         if report["stream"]["saw_error"]:
             report["remote_execution"] = "reported_error"
+            rejection_reason = next(
+                (
+                    event["diagnostic"]["reason_code"]
+                    for event in report["stream"]["events"]
+                    if event.get("diagnostic", {}).get("reason_code") in SSE_ADMISSION_REJECTION_REASONS
+                ),
+                None,
+            )
+            if rejection_reason is not None:
+                failure = AdapterError("agentspark_dependency_unavailable")
+                failure.safe_diagnostic = {"reason_code": rejection_reason, "phase": "send"}
+                raise failure
             raise AdapterError("agentspark_stream_error")
         if not report["stream"]["saw_end"]:
             raise AdapterError("agentspark_stream_end_missing")
@@ -184,6 +322,7 @@ async def run_audit(
                 cancelled, failure, reason = exc, "audit_cancelled", "cancelled"
             except Exception as exc:
                 failure = exc.code if isinstance(exc, AdapterError) else "audit_execution_failed"
+                report["failure_diagnostic"] = exception_diagnostic(exc)
                 reason = "cancelled" if failure == "audit_cancelled" else "failed"
             finally:
                 if cleanup_hook is not None and remote_session is not None:
@@ -209,6 +348,7 @@ async def run_audit(
     except Exception as exc:
         failure = exc.code if isinstance(exc, AdapterError) else "audit_lifecycle_failed"
     finally:
+        report["upstream_observations"] = remote.error_observations
         report["cleanup"]["local"] = "closed" if recorder.closed and remote.closed else "close_failed"
         report["callbacks"] = {
             "records": recorder.capture.records,
@@ -279,15 +419,18 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] | None = None)
         if not input_path or not output_path:
             raise AdapterError("relax_input_and_output_paths_required")
         validate_audit_path(args.audit_output, output_path)
-        config = AdapterConfig.from_payload(json.loads(Path(args.config).read_text(encoding="utf-8")))
+        config = AdapterConfig.from_file(args.config)
         session_input = json.loads(Path(input_path).read_text(encoding="utf-8"))
         prepare_envelope(session_input)
         report = asyncio.run(_run_cli(config, context, session_input, allow_dynamic_images=args.allow_dynamic_images))
         write_audit(report, args.audit_output, output_path, context.session_id)
         if report["audit_status"] != "collected":
             persist_failure(
-                args.diagnostics_dir, AdapterError(report.get("failure_code", "audit_failed")),
-                context=context, audit=report, stage="collect",
+                args.diagnostics_dir,
+                AdapterError(report.get("failure_code", "audit_failed")),
+                context=context,
+                audit=report,
+                stage="collect",
             )
     except (Exception, KeyboardInterrupt) as exc:
         persist_failure(args.diagnostics_dir, exc, context=context, audit=report)

@@ -1,7 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Real frozen policy tests with controlled RM replies; no service or GPU calls."""
+"""Real frozen policy tests with controlled RM replies; no service or GPU
+calls."""
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -342,7 +344,8 @@ async def test_actual_forwarded_reward_view_and_source_request_have_no_invented_
 
 
 @pytest.mark.asyncio
-async def test_http_failure_is_not_retried_and_raw_error_body_is_not_exposed(contract):
+async def test_http_failure_exhausts_retries_without_exposing_raw_error_body(contract, monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
     count = 0
 
     async def reply(_request):
@@ -355,12 +358,13 @@ async def test_http_failure_is_not_retried_and_raw_error_body_is_not_exposed(con
             await score_audit(
                 _audit(), contract=contract, reward_base_url="https://reward.invalid/prefix", client=client
             )
-    assert count == 1
+    assert count == 3
     assert failure.value.safe_diagnostic == {"http_status": 503}
 
 
 @pytest.mark.asyncio
-async def test_proxy_schema_failure_preserves_only_reviewed_reason_code(contract):
+async def test_proxy_schema_failure_preserves_only_reviewed_reason_code(contract, monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
     detail = (
         "private-token /private/path https://private.invalid: "
         "judge JSON/schema validation failed: issue impacts must cover every verified root exactly once"
@@ -374,9 +378,10 @@ async def test_proxy_schema_failure_preserves_only_reviewed_reason_code(contract
     async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as client:
         with pytest.raises(RewardError, match="^reward_http_failure$") as failure:
             await score_audit(_audit(), contract=contract, reward_base_url="https://reward.invalid", client=client)
-    assert len(requests) == 1
+    assert len(requests) == 3
     assert failure.value.safe_diagnostic == {
-        "http_status": 502, "reason_code": "judge_issue_impact_coverage_invalid",
+        "http_status": 502,
+        "reason_code": "judge_issue_impact_coverage_invalid",
     }
     assert "private" not in json.dumps(failure.value.safe_diagnostic)
 
@@ -452,4 +457,212 @@ def test_runtime_snapshot_must_match_actual_provider_template(contract):
     audit = _audit()
     audit["source_input"]["metadata"]["agentspark"]["prompt_spec"]["user_prompt"] = "different provider clock"
     with pytest.raises(RewardError, match="reward_runtime_context_not_in_provider_prompt"):
+        trajectory_from_audit(audit, contract)
+
+
+@pytest.fixture(scope="module")
+def scoped_ctr_contract(contract):
+    decoded = _decode(contract, _score(contract))
+    if decoded["metadata"].get("ctr_gate_policy_version") != "followup_local_v1":
+        pytest.skip("This contract predates the scoped CTR gates")
+    return contract
+
+
+@pytest.mark.parametrize(
+    "rule,scoped_field,version",
+    [
+        ("tool_name_valid", None, None),
+        ("tool_args_valid", None, None),
+        ("component_protocol_valid", "ctr_protocol", "followup_protocol_v1"),
+        ("output_bottomline_valid", "ctr_bottomline", "followup_bottomline_v1"),
+    ],
+)
+def test_main_rule_failure_preserves_valid_local_ctr(scoped_ctr_contract, rule, scoped_field, version):
+    contract = scoped_ctr_contract
+    rows = []
+    for index, click in enumerate((0.2, 0.8)):
+        score = _score(contract, click=click)
+        failed = score["rewards"]["v2_rule__" + rule]
+        failed["score"] = 0.0
+        if scoped_field:
+            failed["detail"] = {scoped_field: {"version": version, "valid": True}}
+        decoded = _decode(contract, score)
+        rows.append(
+            dict(
+                index=index,
+                group_index=0,
+                base_reward=decoded["base_reward"],
+                metadata=decoded["metadata"],
+                followup_token_mask=[0, 1, 1],
+            )
+        )
+    out = process_group(contract, rows)
+    assert [row["raw_reward"] for row in out] == [0, 0]
+    assert [row["main_advantage"] for row in out] == [0, 0]
+    assert [row["metadata"]["user_signal_token_credit_advantage"] for row in out] == pytest.approx([-1, 1])
+    assert all(row["metadata"]["quality_first_local_kl_eligible"] for row in out)
+
+
+@pytest.mark.parametrize("failure", ["transport", "local_protocol", "local_bottomline", "safety", "main_quality"])
+def test_invalid_local_context_still_disables_ctr(scoped_ctr_contract, failure):
+    contract = scoped_ctr_contract
+    rows = []
+    for index, click in enumerate((0.2, 0.8)):
+        score = _score(contract, click=click)
+        detail = score["rewards"]["v2_unified_reward"]["detail"]
+        if failure == "transport":
+            score["rewards"]["v2_rule__last_message_is_assistant"]["score"] = 0.0
+        elif failure.startswith("local_"):
+            rule, field, version = (
+                ("component_protocol_valid", "ctr_protocol", "followup_protocol_v1")
+                if failure == "local_protocol"
+                else ("output_bottomline_valid", "ctr_bottomline", "followup_bottomline_v1")
+            )
+            score["rewards"]["v2_rule__" + rule] = {
+                "score": 0.0,
+                "detail": {field: {"version": version, "valid": False}},
+            }
+        elif failure == "safety":
+            detail["safety_gate_hits"] = ["controlled safety failure"]
+            detail["rubric_judgement"]["benchmark_alignment"]["safety_status"] = "fail"
+        else:
+            detail["rubric_judgement"]["quality_first"]["main_quality_passed"] = False
+            detail["rubric_judgement"]["benchmark_alignment"].update(overall_score=0, hard_block=True)
+        decoded = _decode(contract, score)
+        rows.append(
+            dict(
+                index=index,
+                group_index=0,
+                base_reward=decoded["base_reward"],
+                metadata=decoded["metadata"],
+                followup_token_mask=[0, 1, 1],
+            )
+        )
+    out = process_group(contract, rows)
+    assert [row["metadata"]["user_signal_token_credit_advantage"] for row in out] == [0, 0]
+
+
+@pytest.mark.parametrize(
+    "evidence", [None, {"version": "wrong", "valid": True}, {"version": "followup_protocol_v1", "valid": 1}]
+)
+def test_failed_rule_requires_executed_scoped_evidence(scoped_ctr_contract, evidence):
+    score = _score(scoped_ctr_contract)
+    score["rewards"]["v2_rule__component_protocol_valid"] = {"score": 0.0, "detail": {"ctr_protocol": evidence}}
+    with pytest.raises(RewardError):
+        _decode(scoped_ctr_contract, score)
+
+
+@pytest.mark.parametrize("wrapper", ["```xml\n{}\n```", "~~~xml\n{}\n~~~", "`{}`", "```xml\n{}"])
+def test_code_examples_have_no_followup_credit(scoped_ctr_contract, wrapper):
+    example = '<guide_question type="recommend"><sub_question>EXAMPLE</sub_question></guide_question>'
+    actual = '<guide_question type="recommend"><sub_question>VISIBLE</sub_question></guide_question>'
+    code = wrapper.format(example)
+    texts = [code, actual]
+    if wrapper != "```xml\n{}":
+        texts.append(code + "\n" + actual)
+    masks = mark_followup_text(scoped_ctr_contract, texts)
+    assert sum(masks[0]) == 0
+    assert "".join(c for c, keep in zip(actual, masks[1]) if keep) == "VISIBLE"
+    if len(texts) == 3:
+        assert "".join(c for c, keep in zip(texts[2], masks[2]) if keep) == "VISIBLE"
+
+
+async def _no_sleep(delay):
+    assert 1 <= delay <= 16
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("statuses", [(503, "timeout", 200), (429, 200)])
+async def test_reward_retries_preserve_completed_trajectory_identity(contract, monkeypatch, statuses):
+    requests, delays = [], []
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    async def reply(request):
+        requests.append(request.content)
+        status = statuses[len(requests) - 1]
+        if status == "timeout":
+            raise httpx.ReadTimeout("private transport diagnostic", request=request)
+        body = json.loads(request.content)
+        return httpx.Response(status, json={**body, "score": _score(contract)})
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as client:
+        result = await score_audit(
+            _audit(), contract=contract, reward_base_url="https://reward.invalid", client=client
+        )
+        assert not client.is_closed
+    assert result["base_reward"] == 0.8
+    assert len(requests) == len(statuses)
+    assert len(set(requests)) == 1
+    assert len(delays) == len(statuses) - 1
+    assert all(2**i <= delay <= 2 ** (i + 1) for i, delay in enumerate(delays))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [302, 401, 409, 422])
+async def test_permanent_http_failure_is_not_retried(contract, status):
+    requests = []
+
+    async def reply(request):
+        requests.append(request)
+        return httpx.Response(status)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as client:
+        with pytest.raises(RewardError, match="reward_http_failure"):
+            await score_audit(_audit(), contract=contract, reward_base_url="https://reward.invalid", client=client)
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [b"invalid", b'{"a":1,"a":2}', b'{"a":NaN}', None])
+async def test_invalid_success_response_is_not_retried(contract, body):
+    requests = []
+
+    async def reply(request):
+        requests.append(request)
+        if body is not None:
+            return httpx.Response(200, content=body)
+        response = {**json.loads(request.content), "score": _score(contract)}
+        response["execution"]["execution_id"] = "wrong-identity"
+        return httpx.Response(200, json=response)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as client:
+        with pytest.raises(RewardError):
+            await score_audit(_audit(), contract=contract, reward_base_url="https://reward.invalid", client=client)
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("where", ["post", "backoff"])
+async def test_reward_cancellation_stops_retries_and_preserves_external_client(contract, monkeypatch, where):
+    requests = []
+
+    async def reply(request):
+        requests.append(request)
+        if where == "post":
+            raise asyncio.CancelledError()
+        return httpx.Response(503)
+
+    async def sleep(delay):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as client:
+        with pytest.raises(asyncio.CancelledError):
+            await score_audit(_audit(), contract=contract, reward_base_url="https://reward.invalid", client=client)
+        assert not client.is_closed
+    assert len(requests) == 1
+
+
+def test_resource_snapshot_is_bound_to_actual_remote_session(contract):
+    audit = _audit()
+    snapshot = audit["stream"]["events"][-1]["payload"]["data"]
+    snapshot["session_id"] = "synthetic-remote-session"
+    audit["remote_session_sha256"] = hashlib.sha256(snapshot["session_id"].encode()).hexdigest()
+    view = trajectory_from_audit(audit, contract)
+    assert view["metadata"]["agentspark_session_id"] == snapshot["session_id"]
+    snapshot["session_id"] = "another-session"
+    with pytest.raises(RewardError, match="reward_snapshot_session_mismatch"):
         trajectory_from_audit(audit, contract)

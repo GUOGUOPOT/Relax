@@ -4,7 +4,7 @@
 
 import math
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -17,8 +17,25 @@ SCORE_CENTERING_FIELDS = ("rollout_topk_token_ids", "rollout_topk_log_probs")
 _PROBABILITY_TOLERANCE = 1e-5
 
 
+def score_centering_custom_loss(args: Any) -> Callable | None:
+    """An explicit custom loss can consume SC data while retaining its reward
+    normalizer."""
+    if getattr(args, "loss_type", None) != "custom_loss":
+        return None
+    path = getattr(args, "custom_loss_function_path", None)
+    if not path:
+        return None
+    from relax.utils.misc import load_function
+
+    loss = load_function(path)
+    return loss if getattr(loss, "supports_score_centering", False) is True else None
+
+
 def score_centering_enabled(args: Any) -> bool:
-    return getattr(args, "advantage_estimator", None) == "score_centering"
+    return (
+        getattr(args, "advantage_estimator", None) == "score_centering"
+        or score_centering_custom_loss(args) is not None
+    )
 
 
 def resolve_score_centering_vocab_size(args: Any) -> int:
@@ -34,6 +51,15 @@ def resolve_score_centering_vocab_size(args: Any) -> int:
     if vocab_size <= 0:
         raise ValueError("Score Centering requires a positive model vocabulary size")
     return int(vocab_size)
+
+
+def score_centering_allows_multimodal(args: Any) -> bool:
+    custom = score_centering_custom_loss(args)
+    return (
+        custom is not None
+        and getattr(custom, "supports_score_centering_multimodal", False) is True
+        and getattr(args, "use_agentic_rollout", False)
+    )
 
 
 def configure_score_centering_request(args: Any, payload: dict[str, Any]) -> str | None:
@@ -75,6 +101,9 @@ def configure_score_centering_request(args: Any, payload: dict[str, Any]) -> str
             "decoding; Score Centering requires aligned behavior q"
         )
     filtered = float(sampling["top_p"]) < 1 or int(sampling["top_k"]) > 0 or float(sampling["min_p"]) > 0
+    custom = score_centering_custom_loss(args)
+    if filtered and custom is not None and not getattr(custom, "supports_score_centering_sampling_support", False):
+        raise ValueError("This custom Score Centering loss requires unfiltered sampling (top_p=1, top_k=-1, min_p=0)")
     if filtered and int(sampling["top_k"]) <= 0:
         raise ValueError(
             "SGLang return_sampling_mask requires finite top_k to return behavior q for top-p/min-p filtering"
@@ -301,7 +330,9 @@ def append_score_centering_candidates(sample: Sample, ids: np.ndarray, logprobs:
         setattr(sample, field, values if previous is None else np.concatenate((previous, values), axis=0))
 
 
-def validate_score_centering_sample(sample: Sample, k: int, *, vocab_size: int | None = None) -> None:
+def validate_score_centering_sample(
+    sample: Sample, k: int, *, vocab_size: int | None = None, allow_multimodal: bool = False
+) -> None:
     context = f"Score Centering sample {sample.index}"
 
     def has_content(value: Any) -> bool:
@@ -314,8 +345,9 @@ def validate_score_centering_sample(sample: Sample, k: int, *, vocab_size: int |
         return True
 
     media = sample.multimodal_inputs or {}
-    if any(has_content(media.get(key)) for key in ("images", "videos", "audio", "audios")) or any(
-        has_content(value) for value in (sample.multimodal_train_inputs or {}).values()
+    if not allow_multimodal and (
+        any(has_content(media.get(key)) for key in ("images", "videos", "audio", "audios"))
+        or any(has_content(value) for value in (sample.multimodal_train_inputs or {}).values())
     ):
         raise ValueError(f"{context}: Score Centering currently requires text-only training inputs")
     if k <= 0 or (vocab_size is not None and k > vocab_size):
